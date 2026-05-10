@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-disk-cache.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -960,6 +961,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // Disk-based KV cache (optional, replaces prompt_cache when enabled)
+    std::unique_ptr<server_disk_cache> disk_cache;
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -972,10 +975,50 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    bool disk_cache_flushed = false; // true after flush_disk_cache() called from clean_up()
 
+    // Save only prompt tokens (not generated) to disk cache so the hash matches
+    // future requests with the same prompt. Full KV state is preserved; update_slots()
+    // truncates extra positions when loading.
+    bool disk_cache_save_slot(server_slot & slot) {
+        const size_t n_total = slot.prompt.tokens.size();
+        // task is reset to null after release(); fall back to task_prev (last completed task)
+        const auto & ptask = slot.task ? slot.task : slot.task_prev;
+        const size_t n_prompt = (ptask && ptask->n_tokens() > 0)
+            ? std::min((size_t)ptask->n_tokens(), n_total)
+            : n_total;
+        auto prompt_tokens = slot.prompt.tokens.clone();
+        prompt_tokens.keep_first(n_prompt);
+        // Hash the entry by the prompt-only prefix (so future requests with the same
+        // prompt get an exact hit), but record the full token sequence (prompt +
+        // any generated continuation) as entry.tokens. The saved KV state's pos_max
+        // corresponds to the full sequence, so restoring this entry must yield
+        // prompt.tokens of that same length to keep n_past/pos_min bookkeeping consistent.
+        return disk_cache->save(prompt_tokens, ctx_tgt, slot.id, &slot.prompt.tokens, &slot.prompt.checkpoints);
+    }
+
+    void flush_disk_cache() {
+        if (!disk_cache || !ctx_tgt) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0 && !slot.prompt.tokens.has_media()) {
+                disk_cache_save_slot(slot);
+            }
+        }
+        disk_cache_flushed = true;
+    }
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // For the sleeping-state path, llama_backend_free() has not been called yet,
+        // so we flush here. For normal shutdown, flush_disk_cache() was called from
+        // clean_up() before llama_backend_free(), so we skip to avoid accessing a
+        // potentially unusable context.
+        if (!disk_cache_flushed) {
+            flush_disk_cache();
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -989,6 +1032,37 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    void slot_save_and_clear(server_slot & slot) {
+        if (slot.prompt.n_tokens() == 0) {
+            return;
+        }
+
+        bool saved = false;
+
+        // Save to disk cache before clearing (tokens are needed for hashing)
+        // Skip disk cache when tokens contain media (LLAMA_TOKEN_NULL placeholders)
+        if (disk_cache && !slot.prompt.tokens.has_media()) {
+            saved = disk_cache_save_slot(slot);
+        }
+
+        if (prompt_cache) {
+            SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+            if (slot.prompt_save(*prompt_cache)) {
+                saved = true;
+                prompt_cache->update();
+            }
+        }
+
+        if (saved) {
+            SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+        }
+
+        if (params_base.kv_unified) {
+            // [TAG_IDLE_SLOT_CLEAR]
+            slot.prompt_clear();
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1386,7 +1460,21 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        // Initialize disk cache if enabled
+        if (!params_base.cache_disk_path.empty()) {
+            disk_cache = std::make_unique<server_disk_cache>();
+            if (!disk_cache->init(params_base.cache_disk_path, params_base.cache_disk_size_mib)) {
+                SRV_WRN("%s: failed to initialize disk cache, continuing without it\n", __func__);
+                disk_cache.reset();
+            }
+        }
+
+        // Initialize RAM prompt cache (only if disk cache is NOT enabled)
+        if (params_base.cache_ram_mib != 0 && !params_base.cache_disk_path.empty()) {
+            SRV_WRN("%s: --cache-ram is bypassed when disk cache is enabled\n", __func__);
+        }
+
+        if (params_base.cache_ram_mib != 0 && params_base.cache_disk_path.empty()) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
@@ -1395,7 +1483,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
-        } else {
+        } else if (params_base.cache_ram_mib == 0) {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
@@ -1432,6 +1520,14 @@ private:
             callback_state(SERVER_STATE_READY, {});
         }
 
+        // After sleeping/waking, ctx_tgt is a new pointer but slots still hold the old (freed) one.
+        // The disk cache code can call prompt_clear() from get_slot() on a cache miss, which
+        // dereferences slot.ctx_tgt. Refresh it here to prevent a crash.
+        for (auto & slot : slots) {
+            slot.ctx_tgt = ctx_tgt;
+            slot.ctx_dft = ctx_dft.get();
+        }
+
         return true;
     }
 
@@ -1456,8 +1552,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (params_base.cache_ram_mib == 0 && params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -1661,7 +1757,9 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const auto & tokens = ret->prompt.tokens;
+
+            update_cache = update_cache && (prompt_cache || disk_cache);
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
@@ -1671,13 +1769,69 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                // don't save the slot's state if its context is empty
+                if (tokens.size() > 0 && prompt_cache) {
+                    ret->prompt_save(*prompt_cache);
                 }
 
-                prompt_cache->update();
+                // Also save to disk cache if enabled (skip when tokens contain media)
+                if (tokens.size() > 0 && disk_cache && !ret->prompt.tokens.has_media()) {
+                    disk_cache_save_slot(*ret);
+                }
+
+                // Try loading: disk cache first, then RAM prompt cache (skip when tokens contain media)
+                bool loaded = false;
+                if (disk_cache && !task.tokens.has_media()) {
+                    std::string exact_hash;
+                    std::list<common_prompt_checkpoint> loaded_checkpoints;
+                    loaded = disk_cache->load(task.tokens, ctx_tgt, ret->id, &exact_hash, &loaded_checkpoints);
+                    if (loaded) {
+                        // Disk cache restores KV state but does not set prompt.tokens.
+                        // We must set it here so that update_slots() can compute n_past correctly.
+                        // Use the entry's full token sequence (prompt + any generated
+                        // continuation) so prompt.tokens stays consistent with the
+                        // restored memory's pos_max (entry.tokens is a superset of
+                        // task.tokens for an exact hash hit).
+                        const disk_cache_entry * entry = disk_cache->get_entry(exact_hash);
+                        ret->prompt.tokens = server_tokens(
+                                (entry && !entry->tokens.empty()) ? entry->tokens : task.tokens.get_tokens(),
+                                task.tokens.has_mtmd);
+                        ret->prompt.checkpoints = std::move(loaded_checkpoints);
+                    }
+
+                    // Exact miss - try prefix search. Require at least 50% of the
+                    // request tokens to be covered by the cached prefix.
+                    if (!loaded) {
+                        const size_t n_req = task.tokens.get_text_tokens().size();
+                        const size_t min_prefix_len = std::max((size_t)1, n_req / 2);
+                        const std::string prefix_hash = disk_cache->find_best_prefix(task.tokens, min_prefix_len);
+                        if (!prefix_hash.empty()) {
+                            loaded = disk_cache->load_by_hash(prefix_hash, ctx_tgt, ret->id, &loaded_checkpoints);
+                            if (loaded) {
+                                const disk_cache_entry * entry = disk_cache->get_entry(prefix_hash);
+                                if (entry) {
+                                    ret->prompt.tokens = server_tokens(entry->tokens, task.tokens.has_mtmd);
+                                }
+                                ret->prompt.checkpoints = std::move(loaded_checkpoints);
+                                SLT_TRC(*ret, "disk prefix-hit, restored state; prompt.tokens=%d (req=%zu), checkpoints=%zu, mem pos_min=%d pos_max=%d\n",
+                                        ret->prompt.n_tokens(), task.tokens.get_text_tokens().size(), ret->prompt.checkpoints.size(),
+                                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id),
+                                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), ret->id));
+                            }
+                        }
+                    }
+                }
+                if (!loaded && prompt_cache) {
+                    loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                }
+                // On cache miss, do NOT call prompt_clear() here. The slot's existing KV state
+                // is preserved so update_slots() can do KV reuse via common-prefix computation,
+                // exactly as the master code behaves (prompt_load always returns true there, so
+                // prompt_clear was dead code). Calling prompt_clear here crashes on some backends.
+
+                if (prompt_cache) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2447,17 +2601,7 @@ private:
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
+                                slot_save_and_clear(slot);
                             }
                         }
                     }
@@ -3669,7 +3813,7 @@ private:
                             send_error(slot, err);
                             slot.release();
 
-                            // note: it's complicated to keep track of how much of the current batch has been
+                            // note: it is complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
                             slot.prompt_clear();
                         }
@@ -3995,6 +4139,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_disk_cache() {
+    impl->flush_disk_cache();
 }
 
 llama_context * server_context::get_llama_context() const {
