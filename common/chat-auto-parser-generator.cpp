@@ -126,6 +126,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         ctx.extracting_reasoning = extract_reasoning && reasoning.mode != reasoning_mode::NONE;
         ctx.content              = &content;
         ctx.reasoning            = &reasoning;
+        ctx.tools                = &tools;
 
         // Build reasoning parser
         ctx.reasoning_parser = reasoning.build_parser(ctx);
@@ -163,16 +164,122 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
+            const std::string end_tag = trim_whitespace(end);
+
+            // Standard tag-based: optional(<think>reasoning</think>). Reasoning runs up
+            // to the closing tag, which is consumed.
             if (!start.empty()) {
-                // Standard tag-based: optional(<think>reasoning</think>)
-                return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
+                return p.optional(p.optspace(start) + p.reasoning(p.until(end_tag)) + p.optspace(end));
             }
             // Delimiter-style (empty start)
-            return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
+            return p.optional(p.reasoning(p.until(end_tag)) + p.optspace(end));
         }
     }
 
     return p.eps();
+}
+
+common_peg_parser analyze_reasoning::build_trailing_end_parser(parser_build_context & ctx) const {
+    auto & p = ctx.p;
+    if (!ctx.extracting_reasoning || end.empty() || !recover_inline_tool_calls) {
+        return p.eps();
+    }
+    if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+        // Some models (e.g. Qwen) emit </think> after tool calls even though they already
+        // closed the reasoning block before the tool call. Swallow any such stray or
+        // duplicate closing tags so they are not emitted as content.
+        return p.zero_or_more(p.optspace(end));
+    }
+    return p.eps();
+}
+
+common_peg_parser analyze_reasoning::build_content_before_tools(parser_build_context & ctx,
+                                                                const std::string &    trigger_marker) const {
+    auto & p = ctx.p;
+
+    std::vector<std::string> delimiters;
+    if (!trigger_marker.empty()) {
+        delimiters.push_back(trigger_marker);
+    }
+    if (recover_inline_tool_calls && ctx.extracting_reasoning && !end.empty() &&
+        (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY)) {
+        // Stop content at a stray reasoning end tag so it does not leak into content;
+        // the trailing parser then swallows it.
+        delimiters.push_back(trim_whitespace(end));
+    }
+
+    if (delimiters.empty()) {
+        return p.eps();
+    }
+    if (delimiters.size() == 1) {
+        return p.until(delimiters[0]);
+    }
+    return p.until_one_of(delimiters);
+}
+
+common_peg_parser analyze_reasoning::build_recovery_composition(parser_build_context &    ctx,
+                                                                const common_peg_parser & tool_calls,
+                                                                const common_peg_parser & content_before_tools,
+                                                                const common_peg_parser & trailing) const {
+    auto &            p       = ctx.p;
+    const std::string end_tag = trim_whitespace(end);
+
+    // Tool-call start markers (same source as the old recovery reasoning terminators).
+    std::vector<std::string>       marker_strs;
+    std::vector<common_peg_parser> marker_lits;
+    if (ctx.tools) {
+        if (!ctx.tools->format.section_start.empty()) {
+            marker_strs.push_back(ctx.tools->format.section_start);
+            marker_lits.push_back(p.literal(ctx.tools->format.section_start));
+        }
+        if (!ctx.tools->format.per_call_start.empty()) {
+            marker_strs.push_back(ctx.tools->format.per_call_start);
+            marker_lits.push_back(p.literal(ctx.tools->format.per_call_start));
+        }
+    }
+
+    // No markers -> nothing to recover; fall back to the standard composition.
+    if (marker_lits.empty()) {
+        return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) +
+               p.optional(tool_calls) + trailing + p.end();
+    }
+
+    std::vector<std::string> delimiters;
+    delimiters.push_back(end_tag);
+    delimiters.insert(delimiters.end(), marker_strs.begin(), marker_strs.end());
+
+    auto marker_peek  = p.peek(marker_lits.size() == 1 ? marker_lits[0] : p.choice(marker_lits));
+    auto swallow_end  = p.zero_or_more(p.optspace(end));  // swallow the closing/stray </think>
+
+    // B-path shared prefix: reasoning up to the first </think> OR tool marker; only continue
+    // when a marker is what stopped it, then hold during streaming.
+    auto b_prefix = p.optional(p.optspace(start)) +
+                    p.reasoning(p.until_one_of(delimiters)) +
+                    marker_peek +
+                    p.hold_when_partial();
+
+    // B1: illustrative — absorb the in-think call as reasoning up to </think>, then require a
+    //     real post-</think> tool call.
+    auto b1 = b_prefix + p.reasoning(p.until(end_tag)) + p.optspace(end) +
+              p.optional(p.content(content_before_tools)) + tool_calls + trailing + p.end();
+    // B3: terminal — the in-think call is the real call; extract it (only matches at EOS).
+    auto b3 = b_prefix + tool_calls + swallow_end + p.end();
+    // B2: illustrative — absorb the in-think call as reasoning up to </think>, then real text.
+    auto b2 = b_prefix + p.reasoning(p.until(end_tag)) + p.optspace(end) +
+              p.content(p.rest()) + p.end();
+
+    // A / default: standard composition (normal reasoning, post-think calls, or no
+    // reasoning). `swallow_end` after the reasoning parser absorbs a stray/duplicate
+    // </think> that can appear between reasoning-close and a post-</think> tool call
+    // (the standard reasoning parser only consumes the first </think>).
+    auto a = ctx.reasoning_parser + swallow_end + p.optional(p.content(content_before_tools)) +
+             p.optional(tool_calls) + trailing + p.end();
+
+    // B3 is tried first: in LENIENT mode, Literal at EOS returns NEED_MORE_INPUT (not FAIL),
+    // so B1 placed first would return NMI and short-circuit the choice before B3 could be tried.
+    // B3 uses end() which always returns hard FAIL (not NMI) when not at EOS, so B3 cleanly
+    // fails for non-terminal inputs and lets the choice fall through to B1/B2/A.
+    return p.choice({ b3, b1, b2, a });
 }
 
 common_peg_parser analyze_content::build_parser(parser_build_context & ctx) const {
@@ -183,6 +290,13 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
             return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+    }
+    if (ctx.reasoning && ctx.reasoning->recover_inline_tool_calls && ctx.extracting_reasoning &&
+        !ctx.reasoning->end.empty()) {
+        // Recovery mode (Qwen family): stop content at a stray/duplicate reasoning end
+        // tag and swallow it so it is not emitted as content.
+        auto content_body = p.content(p.until(trim_whitespace(ctx.reasoning->end)));
+        return ctx.reasoning_parser + content_body + ctx.reasoning->build_trailing_end_parser(ctx) + p.end();
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }
@@ -243,7 +357,8 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
     // Handle content wrappers if present
     if (ctx.content && ctx.content->is_always_wrapped()) {
         auto wrapped_content = ctx.content->build_optional_wrapped(ctx);
-        return ctx.reasoning_parser + wrapped_content + tools_parser + p.end();
+        auto trailing        = ctx.reasoning->build_trailing_end_parser(ctx);
+        return ctx.reasoning_parser + wrapped_content + tools_parser + trailing + p.end();
     }
 
     std::string tool_start = "{";
@@ -253,7 +368,16 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         tool_start = format.per_call_start;
     }
 
-    return ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
+    auto trailing = ctx.reasoning->build_trailing_end_parser(ctx);
+    auto content_before_tools = ctx.reasoning->build_content_before_tools(ctx, tool_start);
+    bool recovery = ctx.reasoning && ctx.reasoning->recover_inline_tool_calls &&
+                    ctx.extracting_reasoning && !ctx.reasoning->end.empty() &&
+                    (ctx.reasoning->mode == reasoning_mode::TAG_BASED ||
+                     ctx.reasoning->mode == reasoning_mode::TOOLS_ONLY);
+    if (recovery) {
+        return ctx.reasoning->build_recovery_composition(ctx, tools_parser, content_before_tools, trailing);
+    }
+    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tools_parser + trailing + p.end();
 }
 
 common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
@@ -366,13 +490,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         }
     }
 
+    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    auto        content_before_tools = ctx.reasoning->build_content_before_tools(ctx, trigger_marker);
+    auto        trailing             = ctx.reasoning->build_trailing_end_parser(ctx);
+
+    bool recovery = ctx.reasoning && ctx.reasoning->recover_inline_tool_calls &&
+                    ctx.extracting_reasoning && !ctx.reasoning->end.empty() &&
+                    (ctx.reasoning->mode == reasoning_mode::TAG_BASED ||
+                     ctx.reasoning->mode == reasoning_mode::TOOLS_ONLY);
+    if (recovery) {
+        return ctx.reasoning->build_recovery_composition(ctx, tool_calls, content_before_tools, trailing);
+    }
+
     if (!require_calls) {
         tool_calls = p.optional(tool_calls);
     }
-
-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + trailing + p.end();
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
@@ -474,10 +607,18 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     if (!format.per_call_start.empty()) {
         auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
+        // Recovery mode (Qwen family): the model may close </think> between an in-think
+        // tool call and a following one. Swallow any stray closing tags between calls so
+        // both are extracted (stable, monotonic tool count) instead of stalling the parse.
+        auto between_calls = p.space();
+        if (ctx.reasoning && ctx.reasoning->recover_inline_tool_calls && ctx.extracting_reasoning &&
+            !ctx.reasoning->end.empty()) {
+            between_calls = p.space() + p.zero_or_more(p.optspace(ctx.reasoning->end));
+        }
         if (inputs.parallel_tool_calls) {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
+            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(between_calls + wrapped_call) + between_calls);
         } else {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
+            tool_calls = p.trigger_rule("tool-call", wrapped_call + between_calls);
         }
         if (!format.section_start.empty()) {
             tool_calls = p.trigger_rule("tool-calls",
@@ -497,13 +638,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         }
     }
 
+    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    auto        content_before_tools = ctx.reasoning->build_content_before_tools(ctx, trigger_marker);
+    auto        trailing             = ctx.reasoning->build_trailing_end_parser(ctx);
+
+    bool recovery = ctx.reasoning && ctx.reasoning->recover_inline_tool_calls &&
+                    ctx.extracting_reasoning && !ctx.reasoning->end.empty() &&
+                    (ctx.reasoning->mode == reasoning_mode::TAG_BASED ||
+                     ctx.reasoning->mode == reasoning_mode::TOOLS_ONLY);
+    if (recovery) {
+        return ctx.reasoning->build_recovery_composition(ctx, tool_calls, content_before_tools, trailing);
+    }
+
     if (!require_tools) {
         tool_calls = p.optional(tool_calls);
     }
-
-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + trailing + p.end();
 }
 
 }  // namespace autoparser

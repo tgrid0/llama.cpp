@@ -222,6 +222,7 @@ struct tool_id_analysis {
 
 struct analyze_content;
 struct analyze_reasoning;
+struct analyze_tools;
 
 struct parser_build_context {
     common_chat_peg_builder & p;
@@ -230,6 +231,7 @@ struct parser_build_context {
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
+    const analyze_tools *             tools                = nullptr;
 
     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
 };
@@ -259,11 +261,39 @@ struct analyze_reasoning : analyze_base {
     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
 
+    // Inline tool-call recovery (opt-in, set by a template workaround for the Qwen
+    // family and lookalikes). These models sometimes emit a real tool call inside the
+    // reasoning block and close </think> only afterwards, or not at all. When enabled,
+    // a tool-call marker terminates the reasoning block so the call is still extracted,
+    // and stray/duplicate </think> tags are swallowed instead of leaking into content.
+    // Off by default so other models keep the standard prefer-closed behavior.
+    bool recover_inline_tool_calls = false;
+
     analyze_reasoning() = default;
     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
     analyze_reasoning(std::string start_, std::string end_) : start(std::move(start_)), end(std::move(end_)) {}
 
     common_peg_parser build_parser(parser_build_context & ctx) const override;
+
+    // Returns a parser that swallows trailing/duplicate reasoning end markers.
+    // Only active when recover_inline_tool_calls is set: some models (e.g. Qwen) emit
+    // </think> after tool calls even though they already closed the reasoning block
+    // before the tool call. No-op otherwise.
+    common_peg_parser build_trailing_end_parser(parser_build_context & ctx) const;
+
+    // Builds the "content before tools" parser: content runs up to the tool trigger,
+    // and (recovery mode only) also stops at a stray reasoning end tag so it is not
+    // captured as content. trigger_marker may be empty.
+    common_peg_parser build_content_before_tools(parser_build_context & ctx,
+                                                 const std::string &    trigger_marker) const;
+
+    // Recovery mode (Qwen family): full parser body that holds in-<think> tool calls until
+    // EOS and resolves their role (illustrative vs real) at the final parse. `tool_calls` is
+    // the raw (not optional-wrapped) tool-calls parser.
+    common_peg_parser build_recovery_composition(parser_build_context &    ctx,
+                                                 const common_peg_parser & tool_calls,
+                                                 const common_peg_parser & content_before_tools,
+                                                 const common_peg_parser & trailing) const;
 
   private:
     // Look for reasoning markers in rendered content

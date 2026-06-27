@@ -242,6 +242,13 @@ struct parser_executor {
         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos);
     }
 
+    common_peg_parse_result operator()(const common_peg_hold_parser & /* p */) const {
+        if (ctx.is_partial()) {
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos);
+        }
+        return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos);
+    }
+
     common_peg_parse_result operator()(const common_peg_start_parser & /* p */) const {
         return common_peg_parse_result(
             start_pos == 0 ? COMMON_PEG_PARSE_RESULT_SUCCESS : COMMON_PEG_PARSE_RESULT_FAIL,
@@ -853,6 +860,7 @@ void common_peg_arena::resolve_refs() {
             } else if constexpr (std::is_same_v<T, common_peg_schema_parser>) {
                 p.child = resolve_ref(p.child);
             } else if constexpr (std::is_same_v<T, common_peg_epsilon_parser> ||
+                                 std::is_same_v<T, common_peg_hold_parser> ||
                                  std::is_same_v<T, common_peg_start_parser> ||
                                  std::is_same_v<T, common_peg_end_parser> ||
                                  std::is_same_v<T, common_peg_ref_parser> ||
@@ -895,6 +903,8 @@ std::string common_peg_arena::dump_impl(common_peg_parser_id                    
 
         if constexpr (std::is_same_v<T, common_peg_epsilon_parser>) {
             return "Epsilon";
+        } else if constexpr (std::is_same_v<T, common_peg_hold_parser>) {
+            return "Hold";
         } else if constexpr (std::is_same_v<T, common_peg_start_parser>) {
             return "Start";
         } else if constexpr (std::is_same_v<T, common_peg_end_parser>) {
@@ -1515,6 +1525,7 @@ static std::set<std::string> collect_reachable_rules(
             using T = std::decay_t<decltype(p)>;
 
             if constexpr (std::is_same_v<T, common_peg_epsilon_parser> ||
+                          std::is_same_v<T, common_peg_hold_parser> ||
                           std::is_same_v<T, common_peg_start_parser> ||
                           std::is_same_v<T, common_peg_end_parser> ||
                           std::is_same_v<T, common_peg_until_parser> ||
@@ -1617,6 +1628,7 @@ void common_peg_arena::build_grammar(const common_grammar_builder & builder, boo
             using T = std::decay_t<decltype(p)>;
 
             if constexpr (std::is_same_v<T, common_peg_epsilon_parser> ||
+                          std::is_same_v<T, common_peg_hold_parser> ||
                           std::is_same_v<T, common_peg_start_parser> ||
                           std::is_same_v<T, common_peg_end_parser>) {
                 return "";
@@ -1802,6 +1814,8 @@ static nlohmann::json serialize_parser_variant(const common_peg_parser_variant &
 
         if constexpr (std::is_same_v<T, common_peg_epsilon_parser>) {
             return json{{"type", "epsilon"}};
+        } else if constexpr (std::is_same_v<T, common_peg_hold_parser>) {
+            return json{{"type", "hold"}};
         } else if constexpr (std::is_same_v<T, common_peg_start_parser>) {
             return json{{"type", "start"}};
         } else if constexpr (std::is_same_v<T, common_peg_end_parser>) {
@@ -1898,6 +1912,9 @@ static common_peg_parser_variant deserialize_parser_variant(const nlohmann::json
 
     if (type == "epsilon") {
         return common_peg_epsilon_parser{};
+    }
+    if (type == "hold") {
+        return common_peg_hold_parser{};
     }
     if (type == "start") {
         return common_peg_start_parser{};

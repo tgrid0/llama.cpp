@@ -3259,6 +3259,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     if (params.debug) {
         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
     }
+    if (is_partial) {
+        flags |= COMMON_PEG_PARSE_FLAG_PARTIAL;
+    }
 
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);

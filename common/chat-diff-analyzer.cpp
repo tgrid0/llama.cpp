@@ -49,6 +49,20 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               LOG_DBG(ANSI_ORANGE "[Patch: old Qwen/Deepseek thinking template]\n" ANSI_RESET);
           }
       },
+      // Qwen3.5/3.6 family (and Nemotron-3, which shares the same XML tool-call format):
+      // these models sometimes emit a real tool call inside the <think> block and close
+      // </think> only afterwards, or not at all. Enable inline tool-call recovery so the
+      // call is still extracted and stray/duplicate </think> tags are not leaked into
+      // content. Scoped by the model-specific tool-call instruction so other models are
+      // unaffected.
+      [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+          if (analysis.reasoning.mode != reasoning_mode::NONE &&
+              trim_whitespace(analysis.reasoning.end) == "</think>" &&
+              tmpl.src.find("must be nested within <tool_call></tool_call>") != std::string::npos) {
+              analysis.reasoning.recover_inline_tool_calls = true;
+              LOG_DBG(ANSI_ORANGE "[Patch: Qwen-family inline tool-call recovery]\n" ANSI_RESET);
+          }
+      },
       // Granite 3.3, with separate reasoning and content markers
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find("Write your thoughts between <think></think> and write your response between "

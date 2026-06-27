@@ -146,6 +146,7 @@ enum common_peg_parse_flags {
     COMMON_PEG_PARSE_FLAG_NONE    = 0,
     COMMON_PEG_PARSE_FLAG_LENIENT = 1 << 0,
     COMMON_PEG_PARSE_FLAG_DEBUG   = 1 << 1,
+    COMMON_PEG_PARSE_FLAG_PARTIAL = 1 << 2,
 };
 
 inline common_peg_parse_flags operator|(common_peg_parse_flags a, common_peg_parse_flags b) {
@@ -179,6 +180,7 @@ struct common_peg_parse_context {
 
     bool is_lenient() const { return flags & COMMON_PEG_PARSE_FLAG_LENIENT; }
     bool is_debug() const { return flags & COMMON_PEG_PARSE_FLAG_DEBUG; }
+    bool is_partial() const { return flags & COMMON_PEG_PARSE_FLAG_PARTIAL; }
 };
 
 class common_peg_arena;
@@ -189,6 +191,8 @@ struct common_peg_epsilon_parser {};
 struct common_peg_start_parser {};
 
 struct common_peg_end_parser {};
+
+struct common_peg_hold_parser {};
 
 struct common_peg_literal_parser {
     std::string literal;
@@ -285,6 +289,7 @@ using common_peg_parser_variant = std::variant<
     common_peg_epsilon_parser,
     common_peg_start_parser,
     common_peg_end_parser,
+    common_peg_hold_parser,
     common_peg_literal_parser,
     common_peg_sequence_parser,
     common_peg_choice_parser,
@@ -369,6 +374,11 @@ class common_peg_parser_builder {
     // Matches the end of the input.
     //   S -> $
     common_peg_parser end() { return add(common_peg_end_parser{}); }
+
+    // Streaming barrier: transparent (eps) on a final parse; yields NEED_MORE_INPUT on a
+    // partial parse so the parser holds here (nodes captured before it still stream).
+    //   S -> (partial ? need-more : ε)
+    common_peg_parser hold_when_partial() { return add(common_peg_hold_parser{}); }
 
     // Matches an exact literal string.
     //   S -> "hello"

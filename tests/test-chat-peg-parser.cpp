@@ -21,6 +21,7 @@ static void test_example_qwen3_non_coder(testing & t);
 static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
+static void test_hold_when_partial(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -39,6 +40,7 @@ int main(int argc, char * argv[]) {
     t.test("comparison", test_command7_parser_compare);
     t.test("prefix tool names", test_prefix_tool_names);
     t.test("tagged peg parser", test_tagged_peg_parser);
+    t.test("hold when partial", test_hold_when_partial);
 
     return t.summary();
 }
@@ -980,4 +982,16 @@ static void test_tagged_peg_parser(testing & t) {
         t.assert_equal("fun_pre should be '<function='", "<function=", result.tags["fun_pre"]);
         t.assert_equal("fun_post should be '>'", ">", result.tags["fun_post"]);
     });
+}
+
+static void test_hold_when_partial(testing & t) {
+    auto parser = build_tagged_peg_parser([](common_peg_parser_builder & p) {
+        return p.literal("a") + p.hold_when_partial() + p.literal("b") + p.end();
+    });
+    // Final parse (no PARTIAL flag): the hold is transparent, whole input matches.
+    t.assert_true("final parse commits past the hold",
+                  parser.parse_and_extract("ab").result.success());
+    // Partial parse: the hold refuses to commit, yielding NEED_MORE_INPUT.
+    t.assert_true("partial parse holds at the barrier",
+                  parser.parse_and_extract("ab", COMMON_PEG_PARSE_FLAG_PARTIAL).result.need_more_input());
 }

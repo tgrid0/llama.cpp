@@ -2278,19 +2278,15 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
-        // tool call segment in reasoning
+        // Inline tool-call recovery: the model reasons, then emits a real tool call inside
+        // the reasoning block, closing </think> only afterwards. Under the Qwen-family
+        // recovery mode the call is extracted (not left buried in reasoning) and the
+        // trailing </think> is swallowed rather than leaked into content. The alternative
+        // "a tool mention inside reasoning stays reasoning" interpretation is intentionally
+        // not supported for these models: it cannot be told apart from a genuine in-think
+        // call during streaming.
         tst.test(
                "Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n</think>\n\n"
-               "<tool_call>\n"
                "<function=python>\n"
                "<parameter=code>\n"
                "def hello():\n"
@@ -2299,26 +2295,147 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                "hello()\n"
                "</parameter>\n"
                "</function>\n"
-               "</tool_call>")
+               "</tool_call>\n</think>")
             .enable_thinking(true)
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({
                 python_tool
         })
-            .expect_reasoning(
-                "Let's call a tool: <tool_call>\n"
-                "<function=python>\n"
-                "<parameter=code>\n"
-                "def hello():\n"
-                "    print(\"Not the real call!\")\n"
-                "\n"
-                "hello()\n"
-                "</parameter>\n"
-                "</function>\n"
-                "</tool_call>")
+            .expect_reasoning("Let's call a tool:")
+            .expect_content("")
             .expect_tool_calls({
                 { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
             })
+            .run();
+
+        // Qwen-family inline tool-call recovery: the model emits a real tool call inside
+        // the reasoning block and never closes </think>. The call must still be extracted
+        // and no </think> must leak into content. (Case B)
+        tst.test(
+               "Now let me look at the current state of the files:\n"
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "print(1)\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ python_tool })
+            .expect_reasoning("Now let me look at the current state of the files:")
+            .expect_content("")
+            .expect_tool_calls({ { "python", "{\"code\": \"print(1)\"}", {} } })
+            .run();
+
+        // Case B, but the model closes </think> *after* the in-think tool call. The call
+        // is extracted and the trailing </think> is swallowed (not leaked to content).
+        tst.test(
+               "Now let me look at the current state of the files:\n"
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "print(1)\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "</think>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ python_tool })
+            .expect_reasoning("Now let me look at the current state of the files:")
+            .expect_content("")
+            .expect_tool_calls({ { "python", "{\"code\": \"print(1)\"}", {} } })
+            .run();
+
+        // Duplicate/stray </think>: the model closes reasoning, emits a spurious second
+        // </think>, then makes the tool call. The stray tag must not leak into content.
+        tst.test(
+               "Now let me look at the current state of the files:</think>\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "print(1)\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ python_tool })
+            .expect_reasoning("Now let me look at the current state of the files:")
+            .expect_content("")
+            .expect_tool_calls({ { "python", "{\"code\": \"print(1)\"}", {} } })
+            .run();
+
+        // Reasoning, then content, then a stray trailing </think> with no tool call. The
+        // stray tag must be swallowed rather than appended to content.
+        tst.test(
+               "Now let me also look at the old format:</think>\n"
+               "Now let me understand the old config format and the build_utils module.\n"
+               "</think>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ python_tool })
+            .expect_reasoning("Now let me also look at the old format:")
+            .expect_content("Now let me understand the old config format and the build_utils module.")
+            .run();
+
+        // --- Hold-until-EOS: in-<think> tool call resolution (recover_inline_tool_calls) ---
+
+        // Edge 1: in-think call is terminal (call, </think>, EOS) -> extract as a real call.
+        tst.test(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>\n"
+               "</think>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+
+        // Edge 2: unclosed </think> (call, EOS) -> still terminal -> extract.
+        tst.test(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+
+        // Edge 3: in-think call + </think> + real post-think call -> in-think is illustrative
+        // (stays reasoning), only the post-think call is emitted.
+        tst.test(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>\n"
+               "</think>\n\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n2\n</parameter>\n</function>\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 2})", {} } })
+            .run();
+
+        // Edge 4: in-think call + </think> + real text answer -> in-think is illustrative
+        // (stays reasoning), text becomes content (pre-change behavior restored).
+        tst.test(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>\n"
+               "</think>\n\n"
+               "The answer is 42.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning(
+               "I'm\nthinking\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>")
+            .expect_content("The answer is 42.")
             .run();
 
         // No args tool
@@ -2776,19 +2893,15 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
-        // tool call segment in reasoning
+        // Inline tool-call recovery: the model reasons, then emits a real tool call inside
+        // the reasoning block, closing </think> only afterwards. Under the Qwen-family
+        // recovery mode the call is extracted (not left buried in reasoning) and the
+        // trailing </think> is swallowed rather than leaked into content. The alternative
+        // "a tool mention inside reasoning stays reasoning" interpretation is intentionally
+        // not supported for these models: it cannot be told apart from a genuine in-think
+        // call during streaming.
         tst.test(
                "Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n</think>\n"
-               "<tool_call>\n"
                "<function=python>\n"
                "<parameter=code>\n"
                "def hello():\n"
@@ -2797,23 +2910,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                "hello()\n"
                "</parameter>\n"
                "</function>\n"
-               "</tool_call>\n"
-            )
+               "</tool_call>\n</think>")
             .enable_thinking(true)
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({
                 python_tool
         })
-            .expect_reasoning("Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n")
+            .expect_reasoning("Let's call a tool:")
+            .expect_content("")
             .expect_tool_calls({
                 { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
             })
