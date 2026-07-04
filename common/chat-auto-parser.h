@@ -295,6 +295,16 @@ struct analyze_reasoning : analyze_base {
                                                  const common_peg_parser & content_before_tools,
                                                  const common_peg_parser & trailing) const;
 
+    // Recovery mode: recursive post-reasoning body. Content segments may contain
+    // illustrative tool-call markers or </think> mentions (kept as content); the body
+    // terminates either with real tool calls running to EOS (held during streaming until
+    // EOS resolves real vs illustrative) or at EOS with trailing stray/duplicate </think>
+    // tags swallowed. `tool_calls` may be null (content-only requests, no markers).
+    common_peg_parser build_recovery_content_loop(parser_build_context &           ctx,
+                                                  const common_peg_parser *        tool_calls,
+                                                  const std::vector<std::string> & marker_strs,
+                                                  const std::string &              rule_name) const;
+
   private:
     // Look for reasoning markers in rendered content
     void compare_reasoning_presence();

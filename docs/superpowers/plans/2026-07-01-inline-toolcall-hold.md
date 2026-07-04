@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status:** Tasks 1–6 implemented in commit `6aaeb31d4`. Task 7 (2026-07-02 amendment)
+> fixes a production regression found afterwards: illustrative markers in post-`</think>`
+> content broke the parse. See the addendum in the design spec.
+
 **Goal:** Replace eager extraction of tool calls emitted inside a Qwen `<think>` block with a hold-until-EOS scheme that streams reasoning up to the in-think tool marker, withholds the rest during streaming, and resolves the call's role (real vs illustrative) at the final parse.
 
 **Architecture:** Add one parse-time PEG primitive, `hold_when_partial()`, gated by a new `COMMON_PEG_PARSE_FLAG_PARTIAL`. In recovery mode (`recover_inline_tool_calls`), prepend an ordered-choice "B path" to the standard parser composition: reasoning runs `until_one_of([</think>] + tool-markers)`, and if it stops at a tool marker, `hold_when_partial()` returns `NEED_MORE_INPUT` during streaming (holding, carrying the reasoning-up-to-marker node) and `eps` at the final parse (resolving via B1 illustrative-with-call / B3 terminal-extract / B2 illustrative-with-text). Non-recovery models are untouched.
@@ -599,6 +603,33 @@ Expected: all PASS. In particular `test-chat-auto-parser` (previously 499 assert
 The edge-3 streaming test (two complete tool-call blocks, first inside reasoning) exercises the exact pattern that produced `Invalid diff: now finding less tool calls!` on the current branch. Its green `.run()` in Task 3 is the regression proof. No separate action needed beyond confirming Task 3's tests are in the passing set.
 
 ---
+
+### Task 7 (amendment, 2026-07-02): post-reasoning content loop for illustrative markers
+
+**Trigger:** Production failure through OpenCode → LiteLLM → llama-server. A model asked to
+*describe* this feature wrote `<tool_call>`/`</think>` tags in its content; the recovery
+composition allowed only one content segment before mandatory `end()`, so the final parse
+failed and the server threw `"The model produced output that does not match the expected
+peg-native format"` (stream aborted, `litellm.MidStreamFallbackError`). The `</think>`
+content delimiter introduced by Task 3 was the regression; line-anchored `<tool_call>`
+blocks in content were broken even before it.
+
+- [x] **Step 1: Failing regression tests** — five tests in the Qwen3.5 block of
+  `tests/test-chat.cpp` ("Illustrative markers in CONTENT" group): inline
+  `<tool_call></tool_call>` mention; valid example block + trailing text; `</think>`
+  mention mid-content (tools and no-tools paths); unknown-function example block.
+- [x] **Step 2: `build_recovery_content_loop`** in `common/chat-auto-parser-generator.cpp`
+  (declared in `common/chat-auto-parser.h`): recursive rule
+  `content(until_one_of(markers+</think>)) + choice({ peek(marker)+hold+tool_calls+swallow+end,
+  swallow+end, content(marker)+recurse })`. The hold precedes `tool_calls` so a partial parse
+  short-circuits before any tool nodes are captured (same reason `b_prefix` holds before the
+  call parser). B1/B2 collapse into one `b12` path ending in the loop; path A and the
+  no-tools `analyze_content` recovery branch end in it too.
+- [x] **Step 3: `skip_grammar_test` harness flag** — the two complete-example-block tests
+  are inputs constrained sampling would never produce (the lazy-grammar trigger forces a
+  real call), so the harness's grammar simulation correctly rejects them; the flag skips
+  only that simulation while still exercising parser + streaming behavior.
+- [x] **Step 4: Verify** — `test-chat` (all templates) and `test-chat-peg-parser` green.
 
 ## Self-Review
 

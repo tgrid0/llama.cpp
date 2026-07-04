@@ -1062,6 +1062,11 @@ struct peg_test_case {
     common_chat_msg              expect;
     bool                         is_partial            = false;
     bool                         expect_reconstruction = false;
+    // Skip the constrained-sampling grammar simulation. For inputs that lazy-grammar
+    // sampling would never produce (e.g. an illustrative tool-call block in content,
+    // where the trigger would fire and force a real call), but that the parser must
+    // still handle gracefully when grammar enforcement is not active.
+    bool                         skip_grammar_test     = false;
 };
 
 struct make_peg_parser {
@@ -1193,7 +1198,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
     assert_msg_equals(tc.expect, msg_accum, true);
 
     // Test grammar if present in params
-    if (!parser.params_.grammar.empty()) {
+    if (!tc.skip_grammar_test && !parser.params_.grammar.empty()) {
         auto grammar = build_grammar(parser.params_.grammar);
         if (!grammar) {
             throw std::runtime_error("Failed to build grammar: " + parser.params_.grammar);
@@ -1509,6 +1514,11 @@ class peg_test_builder {
 
     peg_test_builder & expect_reconstruction(bool val = true) {
         tc_.expect_reconstruction = val;
+        return *this;
+    }
+
+    peg_test_builder & skip_grammar_test(bool val = true) {
+        tc_.skip_grammar_test = val;
         return *this;
     }
 
@@ -2436,6 +2446,87 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                "I'm\nthinking\n"
                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>")
             .expect_content("The answer is 42.")
+            .run();
+
+        // --- Illustrative markers in CONTENT after a properly closed reasoning block.
+        //     A model writing *about* tool-call/reasoning syntax must not break the parse
+        //     (regression: content used to stop at the marker with no way to continue,
+        //     failing the final parse). ---
+
+        // Inline <tool_call></tool_call> mention mid-sentence stays content.
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "This commit adds recovery for tool calls emitted inside reasoning tags "
+               "(e.g. <tool_call></tool_call> inside <think>). More text after.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content(
+               "This commit adds recovery for tool calls emitted inside reasoning tags "
+               "(e.g. <tool_call></tool_call> inside <think>). More text after.")
+            .run();
+
+        // A valid-looking example call block in content followed by more text is
+        // illustrative (a real call would end the message) -> stays content. Streaming
+        // holds from the marker until EOS resolves this. Constrained sampling would not
+        // produce this input (the trigger forces a real call), so skip the grammar test;
+        // the parser must still survive it when grammar enforcement is off.
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "For example:\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>\n"
+               "That is the format.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .skip_grammar_test()
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content(
+               "For example:\n"
+               "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>\n"
+               "That is the format.")
+            .run();
+
+        // A </think> mention mid-content stays content (only trailing stray tags at EOS
+        // are swallowed).
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "Reasoning is written between <think> and </think> tags. More text after.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("Reasoning is written between <think> and </think> tags. More text after.")
+            .run();
+
+        // An example call block that does not match any defined tool stays content.
+        // (Skip the grammar test: constrained sampling would not produce an unknown
+        // function name after the trigger.)
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "For example:\n"
+               "<tool_call>\n<function=python>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n"
+               "That is the format.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .skip_grammar_test()
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content(
+               "For example:\n"
+               "<tool_call>\n<function=python>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n"
+               "That is the format.")
+            .run();
+
+        // Same for a request WITHOUT tools (content-only parser path).
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "Reasoning is written between <think> and </think> tags. More text after.")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("Reasoning is written between <think> and </think> tags. More text after.")
             .run();
 
         // No args tool

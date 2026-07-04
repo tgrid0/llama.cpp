@@ -217,6 +217,53 @@ common_peg_parser analyze_reasoning::build_content_before_tools(parser_build_con
     return p.until_one_of(delimiters);
 }
 
+common_peg_parser analyze_reasoning::build_recovery_content_loop(parser_build_context &           ctx,
+                                                                 const common_peg_parser *        tool_calls,
+                                                                 const std::vector<std::string> & marker_strs,
+                                                                 const std::string &              rule_name) const {
+    auto &            p       = ctx.p;
+    const std::string end_tag = trim_whitespace(end);
+
+    auto swallow_end = p.zero_or_more(p.optspace(end));
+
+    // Content stops at any tool-call marker or at a reasoning end tag; the choice below
+    // then decides whether the marker is real (terminal tool calls / trailing close) or
+    // illustrative (consumed back into content, loop continues).
+    std::vector<std::string> delimiters = marker_strs;
+    delimiters.push_back(end_tag);
+
+    return p.rule(rule_name, [&]() {
+        std::vector<common_peg_parser> after;
+
+        if (tool_calls != nullptr && !marker_strs.empty()) {
+            std::vector<common_peg_parser> marker_lits;
+            marker_lits.reserve(marker_strs.size());
+            for (const auto & m : marker_strs) {
+                marker_lits.push_back(p.literal(m));
+            }
+            auto marker_peek = p.peek(marker_lits.size() == 1 ? marker_lits[0] : p.choice(marker_lits));
+            // Terminal: the marker starts real tool calls that run to EOS. The hold must
+            // come before the tool-call parser: a partial parse short-circuits at the hold,
+            // so no tool nodes are captured (and streamed) before EOS resolves whether the
+            // block is a real call or an illustrative mention followed by more content.
+            after.push_back(marker_peek + p.hold_when_partial() + *tool_calls + swallow_end + p.end());
+        }
+
+        // Trailing stray/duplicate </think> tags at EOS (also matches plain EOS).
+        after.push_back(swallow_end + p.end());
+
+        // Illustrative: the marker is plain text; consume it as content and continue.
+        std::vector<common_peg_parser> as_content;
+        as_content.reserve(delimiters.size());
+        for (const auto & d : delimiters) {
+            as_content.push_back(p.literal(d));
+        }
+        after.push_back(p.content(as_content.size() == 1 ? as_content[0] : p.choice(as_content)) + p.ref(rule_name));
+
+        return p.content(p.until_one_of(delimiters)) + p.choice(after);
+    });
+}
+
 common_peg_parser analyze_reasoning::build_recovery_composition(parser_build_context &    ctx,
                                                                 const common_peg_parser & tool_calls,
                                                                 const common_peg_parser & content_before_tools,
@@ -258,28 +305,28 @@ common_peg_parser analyze_reasoning::build_recovery_composition(parser_build_con
                     marker_peek +
                     p.hold_when_partial();
 
-    // B1: illustrative — absorb the in-think call as reasoning up to </think>, then require a
-    //     real post-</think> tool call.
-    auto b1 = b_prefix + p.reasoning(p.until(end_tag)) + p.optspace(end) +
-              p.optional(p.content(content_before_tools)) + tool_calls + trailing + p.end();
+    // Post-</think> body shared by the illustrative-B path and the standard A path:
+    // content segments that may contain illustrative markers (kept as content),
+    // terminated by real tool calls at EOS or by EOS with stray </think> swallowed.
+    auto body = build_recovery_content_loop(ctx, &tool_calls, marker_strs, "recovery-content");
+
     // B3: terminal — the in-think call is the real call; extract it (only matches at EOS).
     auto b3 = b_prefix + tool_calls + swallow_end + p.end();
-    // B2: illustrative — absorb the in-think call as reasoning up to </think>, then real text.
-    auto b2 = b_prefix + p.reasoning(p.until(end_tag)) + p.optspace(end) +
-              p.content(p.rest()) + p.end();
+    // B12: illustrative — absorb the in-think call as reasoning up to </think>, then parse
+    // the remainder like a normal post-reasoning body (content and/or real tool calls).
+    auto b12 = b_prefix + p.reasoning(p.until(end_tag)) + p.optspace(end) + body;
 
     // A / default: standard composition (normal reasoning, post-think calls, or no
     // reasoning). `swallow_end` after the reasoning parser absorbs a stray/duplicate
     // </think> that can appear between reasoning-close and a post-</think> tool call
     // (the standard reasoning parser only consumes the first </think>).
-    auto a = ctx.reasoning_parser + swallow_end + p.optional(p.content(content_before_tools)) +
-             p.optional(tool_calls) + trailing + p.end();
+    auto a = ctx.reasoning_parser + swallow_end + body;
 
     // B3 is tried first: in LENIENT mode, Literal at EOS returns NEED_MORE_INPUT (not FAIL),
-    // so B1 placed first would return NMI and short-circuit the choice before B3 could be tried.
-    // B3 uses end() which always returns hard FAIL (not NMI) when not at EOS, so B3 cleanly
-    // fails for non-terminal inputs and lets the choice fall through to B1/B2/A.
-    return p.choice({ b3, b1, b2, a });
+    // so B12 placed first would return NMI and short-circuit the choice before B3 could be
+    // tried. B3 uses end() which always returns hard FAIL (not NMI) when not at EOS, so B3
+    // cleanly fails for non-terminal inputs and lets the choice fall through to B12/A.
+    return p.choice({ b3, b12, a });
 }
 
 common_peg_parser analyze_content::build_parser(parser_build_context & ctx) const {
@@ -293,10 +340,10 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
     }
     if (ctx.reasoning && ctx.reasoning->recover_inline_tool_calls && ctx.extracting_reasoning &&
         !ctx.reasoning->end.empty()) {
-        // Recovery mode (Qwen family): stop content at a stray/duplicate reasoning end
-        // tag and swallow it so it is not emitted as content.
-        auto content_body = p.content(p.until(trim_whitespace(ctx.reasoning->end)));
-        return ctx.reasoning_parser + content_body + ctx.reasoning->build_trailing_end_parser(ctx) + p.end();
+        // Recovery mode (Qwen family): a reasoning end tag mentioned mid-content stays
+        // content; only trailing stray/duplicate tags at EOS are swallowed.
+        return ctx.reasoning_parser +
+               ctx.reasoning->build_recovery_content_loop(ctx, nullptr, {}, "recovery-content");
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }

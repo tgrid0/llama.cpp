@@ -1,7 +1,7 @@
 # Hold-until-EOS resolution for in-`<think>` tool calls (Qwen family)
 
-Date: 2026-07-01
-Status: Approved design, pending implementation plan
+Date: 2026-07-01 (amended 2026-07-02: post-reasoning content loop, see addendum)
+Status: Implemented (commit `6aaeb31d4` + content-loop amendment)
 Scope gate: `analyze_reasoning::recover_inline_tool_calls` (Qwen3.5/3.6 family + Nemotron-3 XML tool format)
 
 ## Problem
@@ -171,3 +171,66 @@ extra, not a Qwen-observed requirement; implement it only if it falls out natura
   hold-until-EOS; it would require a monotonicity proof per early-release rule.
 - Extending the behavior to non-recovery models.
 - Any change to the disk-cache subsystem.
+
+## Addendum (2026-07-02): illustrative markers in post-`</think>` CONTENT
+
+### Gap found in production
+
+The original design only considered markers **inside** the reasoning block. The first
+implementation stopped post-`</think>` content at a tool marker or a stray `</think>` and
+allowed exactly **one** content segment before mandatory `end()`. A model writing *about*
+tool-call/reasoning syntax in its answer (e.g. when asked to analyze this very feature —
+"tool calls go between `<think>` and `</think>`") hit a marker mid-content with no grammar
+path to continue. Every alternative of the recovery choice failed, the final parse threw
+`"The model produced output that does not match the expected peg-native format"`, and the
+HTTP stream aborted mid-response (surfaced by LiteLLM as `MidStreamFallbackError`).
+
+### Fix: recursive post-reasoning content loop
+
+`analyze_reasoning::build_recovery_content_loop` builds a recursive rule shared by the
+illustrative-B path (`b12`, replacing the former separate B1/B2), the standard A path, and
+the no-tools content parser (`analyze_content::build_parser` recovery branch):
+
+```
+recovery-content :=
+  content(until_one_of([tool_markers..., </think>]))
+  + choice({
+      // (t) terminal real tool calls — only at EOS; the hold comes BEFORE the tool-call
+      //     parser so a partial parse short-circuits at the hold and no tool nodes are
+      //     captured/streamed before EOS resolves real vs illustrative
+      peek(tool_marker) + hold_when_partial() + tool_calls + swallow_stray_</think> + end,
+      // (e) EOS, with trailing stray/duplicate </think> tags swallowed
+      swallow_stray_</think> + end,
+      // (c) illustrative — the marker is plain text: consume it as content, recurse
+      content(marker_literal) + recovery-content
+    })
+```
+
+Resolution rule (mirrors the in-think rule): a marker in content is **real** only if a valid
+tool-call block starts there and runs to EOS; anything else (unparseable block, unknown
+function name, any text after the block, a `</think>` mention mid-sentence) re-classifies the
+marker as content and the loop continues. `</think>` swallowing is now positional — only
+immediately after reasoning close (`swallow_end` in path A) or trailing at EOS — never a
+blanket content delimiter.
+
+Monotonicity: unchanged argument. On a partial parse the choice short-circuits at the hold
+(branch t) or at lenient NMI inside the trailing swallow (branch e), so everything from the
+ambiguous marker on is withheld; every final resolution only appends to content or grows
+`tool_calls` from 0. Content before the marker streams normally.
+
+### Interaction with constrained sampling
+
+Under an active lazy grammar, the sampler constrains output once the trigger word
+(`<tool_call>\n`) is generated, so a *complete valid* illustrative block followed by text
+cannot normally be sampled. The parser still handles it (grammar enforcement can be off);
+the corresponding tests set `skip_grammar_test` because the grammar simulation in
+`test_peg_parser` correctly rejects such inputs. Mentions that do not fire the trigger
+(inline `<tool_call></tool_call>` without newline, any `</think>` in content) are reachable
+under constrained sampling and were the actual production failure.
+
+### Additional edge cases (each is a test in `tests/test-chat.cpp`, Qwen3.5 block)
+
+8.  Inline `<tool_call></tool_call>` mention mid-sentence in content → content.
+9.  Valid example call block in content + trailing text → content (held from marker to EOS).
+10. Example call block with unknown function name in content → content.
+11. `</think>` mention mid-content followed by more text → content (tools and no-tools paths).
