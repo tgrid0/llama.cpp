@@ -1525,7 +1525,7 @@ private:
         // dereferences slot.ctx_tgt. Refresh it here to prevent a crash.
         for (auto & slot : slots) {
             slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft.get();
+            slot.ctx_dft = ctx_dft;
         }
 
         return true;
