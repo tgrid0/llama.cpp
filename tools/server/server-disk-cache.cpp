@@ -377,7 +377,8 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
     if (it == m_index.end()) {
         m_misses++;
         save_stats();
-        SRV_DBG("disk cache: miss for %zu tokens (hits=%" PRIu64 ", misses=%" PRIu64 ")\n", tokens.size(), m_hits, m_misses);
+        SRV_INF("disk cache: exact miss for %zu tokens, hash=%.8s... (hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
+                tokens.size(), hash.c_str(), m_hits, m_misses);
         return false;
     }
 
@@ -423,7 +424,8 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
 
     m_hits++;
     save_stats();
-    SRV_DBG("disk cache: hit for %zu tokens (%zu bytes, hits=%" PRIu64 ", misses=%" PRIu64 ")\n", tokens.size(), data.size(), m_hits, m_misses);
+    SRV_INF("disk cache: exact hit for %zu tokens, hash=%.8s... (%zu bytes, hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
+            tokens.size(), hash.c_str(), data.size(), m_hits, m_misses);
     if (out_hash) {
         *out_hash = hash;
     }
@@ -459,8 +461,11 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
         // Already cached, just update timestamp
         it->second.last_used_us = ggml_time_us();
         save_index();
+        SRV_INF("disk cache: already cached, hash=%.8s..., refreshed last_used\n", hash.c_str());
         return true;
     }
+
+    const llama_tokens new_tokens = (full_tokens && !full_tokens->empty()) ? full_tokens->get_text_tokens() : tokens.get_text_tokens();
 
     // Get KV state size
     size_t state_size = llama_state_seq_get_size_ext(ctx, slot_id, 0);
@@ -505,12 +510,46 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
         return false;
     }
 
+    // Prune older entries whose full token sequence is a strict prefix of this
+    // entry's tokens: they are an earlier turn of the same conversation and are
+    // fully superseded (find_best_prefix always prefers the longest match), so
+    // keeping them around only wastes disk budget and accelerates LRU eviction
+    // of genuinely distinct entries (other sessions' cached state). Without this,
+    // a single long-running conversation accumulates one entry per turn forever.
+    // Done only now (new file already safely on disk) so a failed save can never
+    // destroy the old entry without replacing it; done before check_and_evict so
+    // the freed space is available and we don't evict an unrelated, still-live
+    // session's entry just to make room that this conversation's own stale
+    // entries were already holding.
+    size_t n_pruned = 0;
+    for (auto it2 = m_index.begin(); it2 != m_index.end();) {
+        const disk_cache_entry & old_entry = it2->second;
+        if (!old_entry.tokens.empty() &&
+            old_entry.tokens.size() < new_tokens.size() &&
+            std::equal(old_entry.tokens.begin(), old_entry.tokens.end(), new_tokens.begin())) {
+            fs::remove(cache_path(m_path, it2->first + ".bin"));
+            if (old_entry.ckpt_size_bytes > 0) {
+                fs::remove(cache_path(m_path, it2->first + ".ckpt"));
+            }
+            const uint64_t old_total = old_entry.size_bytes + old_entry.ckpt_size_bytes;
+            m_total_size = (old_total <= m_total_size) ? (m_total_size - old_total) : 0;
+            it2 = m_index.erase(it2);
+            n_pruned++;
+        } else {
+            ++it2;
+        }
+    }
+    if (n_pruned > 0) {
+        SRV_INF("disk cache: pruned %zu superseded prefix entr%s from earlier turns of this conversation\n",
+                n_pruned, n_pruned == 1 ? "y" : "ies");
+    }
+
     // Evict before committing to avoid writing then immediately deleting
     check_and_evict(obtained);
 
     // Add to index
     disk_cache_entry entry;
-    entry.tokens       = (full_tokens && !full_tokens->empty()) ? full_tokens->get_text_tokens() : tokens.get_text_tokens();
+    entry.tokens       = new_tokens;
     entry.n_tokens     = (uint32_t)entry.tokens.size();
     entry.size_bytes   = obtained;
     entry.last_used_us = ggml_time_us();
@@ -547,7 +586,7 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
 
     save_index();
 
-    SRV_DBG("disk cache: saved %zu tokens (%zu bytes)\n", tokens.size(), obtained);
+    SRV_INF("disk cache: saved %zu tokens (%zu bytes), hash=%.8s...\n", tokens.size(), obtained, hash.c_str());
     return true;
 }
 
@@ -813,6 +852,11 @@ std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, si
     size_t best_len = min_prefix_len > 0 ? min_prefix_len - 1 : 0;
     std::string best_hash;
 
+    // Tracked purely for diagnostics: the closest match seen, even if it falls
+    // short of min_prefix_len (so a miss can be explained: "closest was X%, needed Y%").
+    size_t closest_len = 0;
+    std::string closest_hash;
+
     for (const auto & [hash, entry] : m_index) {
         if (entry.tokens.empty()) {
             continue;  // old-format entry without token data
@@ -823,10 +867,26 @@ std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, si
         while (lcp < limit && entry.tokens[lcp] == task_toks[lcp]) {
             ++lcp;
         }
+        if (lcp > closest_len) {
+            closest_len = lcp;
+            closest_hash = hash;
+        }
         if (lcp > best_len) {
             best_len = lcp;
             best_hash = hash;
         }
+    }
+
+    const double req_pct = 100.0 * min_prefix_len / std::max((size_t)1, task_toks.size());
+    if (!best_hash.empty()) {
+        SRV_INF("disk cache: prefix match, hash=%.8s..., lcp=%zu/%zu tokens (%.1f%%, required >= %zu = %.1f%%)\n",
+                best_hash.c_str(), best_len, task_toks.size(),
+                100.0 * best_len / std::max((size_t)1, task_toks.size()), min_prefix_len, req_pct);
+    } else {
+        SRV_INF("disk cache: no prefix match for %zu tokens (required >= %zu = %.1f%%, %zu entries in index, closest lcp=%zu tokens = %.1f%% from hash=%.8s...)\n",
+                task_toks.size(), min_prefix_len, req_pct, m_index.size(),
+                closest_len, 100.0 * closest_len / std::max((size_t)1, task_toks.size()),
+                closest_hash.empty() ? "none" : closest_hash.c_str());
     }
 
     return best_hash;
@@ -891,7 +951,8 @@ bool server_disk_cache::load_by_hash(const std::string & hash, llama_context * c
 
     m_hits++;
     save_stats();
-    SRV_DBG("disk cache: prefix hit, loaded %zu bytes for hash %.8s...\n", data.size(), hash.c_str());
+    SRV_INF("disk cache: prefix hit, loaded %zu bytes for hash %.8s... (hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
+            data.size(), hash.c_str(), m_hits, m_misses);
     return true;
 }
 

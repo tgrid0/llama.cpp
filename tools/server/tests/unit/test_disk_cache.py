@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import tempfile
@@ -301,3 +302,104 @@ def test_disk_cache_prefix_hit_token_count_matches_restored_state():
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
         os.unlink(log_path)
+
+
+def test_disk_cache_prunes_superseded_prefix_entries():
+    """A later turn of the same conversation must prune the earlier turn's
+    now-superseded disk-cache entry, instead of accumulating one entry per turn
+    forever. Each entry holds a full KV-state snapshot, so for a long-running
+    multi-turn conversation (as agentic coding clients produce, resending the
+    full growing history every turn) unbounded per-turn accumulation wastes
+    disk budget and starves LRU eviction of entries other sessions still need.
+
+    Builds prompts from explicit token-ID arrays (not concatenated text) so the
+    prefix relationship between turn 1 and turn 2 is exact, independent of any
+    BPE re-tokenization boundary effects.
+    """
+    cache_dir = tempfile.mkdtemp(prefix="llama_disk_cache_prune_")
+    try:
+        server.cache_disk = cache_dir
+        server.cache_disk_size = -1
+        server.start()
+
+        def index_entries():
+            with open(os.path.join(cache_dir, "index.json")) as f:
+                return json.load(f)["entries"]
+
+        long_prompt_tokens = server.make_request("POST", "/tokenize", data={
+            "content": LONG_PROMPT,
+        }).body["tokens"]
+
+        # Turn 1: fill slot 0, remember the exact generated continuation tokens.
+        res1 = server.make_request("POST", "/completion", data={
+            "prompt": long_prompt_tokens,
+            "id_slot": 0,
+            "cache_prompt": True,
+            "return_tokens": True,
+        })
+        assert res1.status_code == 200
+        gen1_tokens = res1.body["tokens"]
+        assert len(gen1_tokens) > 0
+
+        # Trigger idle-slot save+clear of slot 0 (saves entry #1) by launching a
+        # task on slot 1 (cache_idle_slots saves every other non-processing slot).
+        server.make_request("POST", "/completion", data={
+            "prompt": "Hello",
+            "id_slot": 1,
+            "cache_prompt": True,
+        })
+
+        entries_after_turn1 = index_entries()
+        assert len(entries_after_turn1) == 1, entries_after_turn1
+        hash1 = next(iter(entries_after_turn1))
+
+        # Turn 2: echo turn 1's full output (prompt + its own generated
+        # continuation) plus new content, exactly what a chat client resending
+        # conversation history does. No id_slot: slot 0 is idle/cleared, so it
+        # gets picked via LRU, which is what makes get_available_slot() attempt
+        # the disk-cache restore in the first place.
+        extra_tokens = server.make_request("POST", "/tokenize", data={
+            "content": " And what happened after that?",
+        }).body["tokens"]
+        prompt2_tokens = long_prompt_tokens + gen1_tokens + extra_tokens
+
+        res2 = server.make_request("POST", "/completion", data={
+            "prompt": prompt2_tokens,
+            "cache_prompt": True,
+            "return_tokens": True,
+        })
+        assert res2.status_code == 200
+
+        # Trigger idle-slot save+clear again (saves entry #2, and should prune #1).
+        server.make_request("POST", "/completion", data={
+            "prompt": "Hello again",
+            "id_slot": 1,
+            "cache_prompt": True,
+        })
+
+        # Slot 1's own "Hello"/"Hello again" prompts get idle-saved as an
+        # unrelated, unrelated-lineage side effect of cache_idle_slots (any task
+        # launch saves *every* other idle slot, not just the conversation under
+        # test), so don't assert a total entry count — assert on the specific
+        # lineage instead: turn 1's entry must be gone, and exactly one entry
+        # covering the full turn-2 sequence (prompt2 + its own continuation)
+        # must remain.
+        entries_after_turn2 = index_entries()
+        assert hash1 not in entries_after_turn2, (
+            "turn 1's now-superseded entry should have been pruned, not kept "
+            f"alongside turn 2's: {[(h, e['n_tokens']) for h, e in entries_after_turn2.items()]}"
+        )
+
+        lineage_entries = [h for h, e in entries_after_turn2.items() if e["n_tokens"] >= len(prompt2_tokens)]
+        assert len(lineage_entries) == 1, (
+            f"expected exactly one surviving entry for the long-prompt lineage, got: "
+            f"{[(h, e['n_tokens']) for h, e in entries_after_turn2.items()]}"
+        )
+
+        bin_files = {os.path.splitext(f)[0] for f in os.listdir(cache_dir) if f.endswith(".bin")}
+        assert bin_files == set(entries_after_turn2.keys()), (
+            f".bin files on disk must match the index exactly: files={bin_files}, "
+            f"index={set(entries_after_turn2.keys())}"
+        )
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
