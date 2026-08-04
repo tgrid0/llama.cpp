@@ -627,6 +627,12 @@ struct common_params {
     int32_t ple_io_threads = 64;    // ... parallel readers (random 4 KiB reads: this NVMe gives 62k IOPS at 16, 130k at 64, ~160k at 128+)
     int32_t ple_cache_mb   = 256;   // ... row cache, 0 disables
 
+    bool     moe_stream            = false; // stream MoE routed expert weights from disk on demand
+    uint32_t moe_stream_slots      = 0;     // expert cache slots per streamed layer (0 = auto)
+    uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
+    int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
+    bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
