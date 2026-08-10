@@ -1,11 +1,11 @@
 # DeepSeek-V4-Flash on Strix Halo: fix plan
 
-Status: contingent plan for a future agent session. **Depends on the findings from
-`2026-08-10-dsv4-strix-halo-perf-investigation.md`** — do not start implementing here until
-that investigation has produced hard `GGML_SCHED_DEBUG=2` evidence of what's actually
-CPU-bound. This doc lays out the remediation path for each plausible root cause found during
-initial code reading, so the next agent doesn't have to re-derive them, but the actual choice
-of which branch to pursue is gated on that data.
+Status: **root cause confirmed with runtime evidence** (2026-08-10 follow-up session, see the
+investigation doc's final section) — implementation-ready, not contingent anymore. Skip
+straight to Branch A below; Branches B/C are ruled out for now, kept only in case a fix
+attempt surfaces something new. This doc originally laid out the remediation path for each
+plausible root cause found during initial code reading; Branch A's entry is now updated with
+the confirmed, narrower scope.
 
 Target: close the gap between observed (~80 t/s prefill / ~7 t/s decode) and reported-elsewhere
 (~250 t/s prefill / ~11 t/s decode) numbers for the antirez DeepSeek-V4-Flash-0731 Q2/Q4 quant
@@ -15,9 +15,15 @@ on this Strix Halo box, ROCm 7.14, branch `b10331_zgfs`.
 
 If `GGML_SCHED_DEBUG=2` shows a specific op consistently on the CPU backend during decode:
 
-- **`GGML_OP_TOP_K`/`GGML_OP_ARGSORT` — CONFIRMED root cause, not just a hypothesis anymore**
-  (see the "Findings" section appended to the investigation doc, 2026-08-10 follow-up
-  session). `ggml/src/ggml-cuda/ggml-cuda.cu:5211-5217`'s `supports_op` returns
+- **`GGML_OP_TOP_K` — CONFIRMED root cause, with exact runtime evidence, not just a
+  hypothesis** (see the investigation doc's final "Root cause CONFIRMED" section,
+  2026-08-10). The long-context `GGML_SCHED_DEBUG=2` test showed **21 `TOP_K` nodes on CPU**,
+  one per layer using the lightning-indexer attention path (tensor `lid_score_masked`, from
+  `build_lid_top_k` at `src/models/deepseek4.cpp:608-702`), identical count in prefill and
+  every decode pass — plus one unrelated one-time `GET_ROWS` (`token_embd`) and **zero**
+  `SET_ROWS`/`ARGSORT`-as-a-separate-op CPU nodes. **`GGML_OP_SET_ROWS` is confirmed clean on
+  GPU already — drop it from scope, don't spend time on it.**
+  `ggml/src/ggml-cuda/ggml-cuda.cu:5211-5217`'s `supports_op` returns
   `op->src[0]->ne[0] <= 1024` for these ops whenever `GGML_CUDA_USE_CUB` is undefined, and
   `ggml/src/ggml-cuda/common.cuh:110-112` defines that macro as `!defined(GGML_USE_HIP) &&
   ...` — **HIP never gets it**, so this branch's ROCm build forces TOP_K/ARGSORT to the CPU
@@ -51,11 +57,10 @@ If `GGML_SCHED_DEBUG=2` shows a specific op consistently on the CPU backend duri
   a Vulkan or HIP Lightning Indexer kernel for gfx1151 that can be ported/adapted instead of
   starting from scratch. Porting a working implementation is much lower risk than writing a
   new rocWMMA kernel from the NVIDIA WMMA reference.
-- **If it's `GGML_OP_SET_ROWS`** (used every decode step in `build_top_k_mask`/
-  `build_lid_top_k` alongside TOP_K above): check whether it has a HIP kernel at all in
-  `ggml/src/ggml-cuda/`. Lower priority than TOP_K above now that TOP_K has a confirmed,
-  specific cause — only chase this if the long-context re-test still shows CPU nodes after
-  a TOP_K/ARGSORT fix is in place.
+- **`GGML_OP_SET_ROWS` — ruled out, confirmed clean on GPU.** Originally suspected (used
+  right after TOP_K in `build_top_k_mask`), but the long-context runtime test showed zero
+  `SET_ROWS` nodes on CPU. No action needed here; re-open only if a TOP_K/ARGSORT fix lands
+  and CPU nodes are still observed afterward.
 - **If it's `mul_mat`/`mul_mat_id` on `IQ2_XXS`/`Q2_K` expert tensors**: check ggml's AMD
   kernel-selection logic (`mmq.cu`, `mmvq.cu`, and the `GGML_CUDA_CC_*` / architecture
   dispatch tables) for gfx1151 (RDNA3.5) coverage of these specific quant types. If HIP

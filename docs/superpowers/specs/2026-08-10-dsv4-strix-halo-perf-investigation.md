@@ -277,3 +277,42 @@ report), and check both the prefill pass(es) and decode passes for `TOP_K`/`ARGS
 landing on the `CPU` backend. This directly confirms or refutes the mechanism above and
 resolves whether prefill is actually clean or was just under-tested, before committing to
 "port PR #26592" as the fix (see updated fix-plan doc).
+
+## Root cause CONFIRMED with runtime evidence (2026-08-10, same follow-up session)
+
+The long-context re-test above was run. Result: **22 CPU-backend nodes, identical count in
+`pass_1.log` (prefill) and every decode pass through `pass_9.log`** - not a differential
+between phases, a constant. Extracting the op field
+(`grep "node #" pass_N.log | grep -Ei '\[\s*cpu\s' | sed -E 's/^node #\s*[0-9]+ \(\s*([^)]+)\).*/\1/' | sort | uniq -c`)
+on `pass_1.log` gives:
+
+- **21x `TOP_K`**, each consuming a tensor named `lid_score_masked`, spaced ~455 graph-nodes
+  apart (node #445, #898, #1353, #1808, ...) - one per transformer layer using the
+  lightning-indexer attention path. This is exactly `build_lid_top_k`'s output
+  (`src/models/deepseek4.cpp:608-702`, `cb(top_k, "lid_top_k", il)`) - the mechanism identified
+  above, now confirmed by direct runtime evidence, not just code-reading + upstream reports.
+  21 of the model's 43 layers hit this; the rest presumably use `build_raw_attention`'s small
+  sliding window, which never calls `build_lid_top_k` at all.
+- **1x `GET_ROWS`** on `token_embd.weight` at node #0 - the one-time embedding lookup at graph
+  start. Unrelated to the perf problem: cheap, runs once per forward call regardless of phase,
+  not per-layer.
+- **Zero `SET_ROWS` nodes on CPU** - `build_top_k_mask`'s `ggml_set_rows` call (the op that
+  consumes `build_lid_top_k`'s output) runs fine on GPU. This narrows the fix scope: the
+  `SET_ROWS` lead in the fix-plan doc's Branch A can be deprioritized/dropped - only
+  `TOP_K`/`ARGSORT` needs the HIP capability fix, not a second op.
+
+**Why prefill and decode show the identical 22-node count instead of a differential is now
+understood, not a loose end:** the `ne[0] <= 1024` gate is structural (depends on whether a
+given layer's indexer-score row length exceeds 1024, which is a property of the layer/context
+depth, not of prefill-vs-decode), so once context is long enough, the same 21 layers hit it in
+both phases. The original btop asymmetry (prefill GPU 100%/CPU ~0%, decode GPU 45%/CPU 100%) is
+explained by *relative* cost, not *presence*: prefill's 21 CPU-side `TOP_K` calls run alongside
+a huge batched multi-token GPU workload (negligible % of wall time); decode's same 21 calls run
+alongside a single-token GPU workload (dominant % of wall time), each one fanning out across all
+32 threads.
+
+**Conclusion for the fix-plan doc: Branch A is confirmed, Branch B/C are not needed.** The fix
+is exactly the one already scoped there - port/rebase upstream PR #26592 (hipCUB `TOP_K`/
+`ARGSORT` for HIP), watching for the gfx1151 crash in issue #26746 on this exact GPU family. No
+further investigation is required before starting implementation, beyond re-checking #26592's
+upstream review state (it was blocked on a gfx908/gfx1100 `k=1` segfault as of this session).
