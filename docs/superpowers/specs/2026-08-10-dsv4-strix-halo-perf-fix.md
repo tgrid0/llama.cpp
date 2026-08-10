@@ -15,6 +15,32 @@ on this Strix Halo box, ROCm 7.14, branch `b10331_zgfs`.
 
 If `GGML_SCHED_DEBUG=2` shows a specific op consistently on the CPU backend during decode:
 
+- **`GGML_OP_TOP_K`/`GGML_OP_ARGSORT` — CONFIRMED root cause, not just a hypothesis anymore**
+  (see the "Findings" section appended to the investigation doc, 2026-08-10 follow-up
+  session). `ggml/src/ggml-cuda/ggml-cuda.cu:5211-5217`'s `supports_op` returns
+  `op->src[0]->ne[0] <= 1024` for these ops whenever `GGML_CUDA_USE_CUB` is undefined, and
+  `ggml/src/ggml-cuda/common.cuh:110-112` defines that macro as `!defined(GGML_USE_HIP) &&
+  ...` — **HIP never gets it**, so this branch's ROCm build forces TOP_K/ARGSORT to the CPU
+  backend entirely for any row (`ne[0]`) longer than 1024 elements, every single decode step
+  once context depth crosses that line. This is not a slow-kernel problem, it's a hard
+  capability gate routing the op off-GPU.
+  - **Primary fix path: port/rebase upstream PR #26592** ("CUDA: Enable CUB path on HIP via
+    hipCUB") — it targets exactly this gap for exactly this model family and reports the same
+    order-of-magnitude decode slowdown independently. As of 2026-08-10 it is **open and
+    blocked upstream**, not mergeable as-is: a reviewer found segfaults in
+    `test-backend-ops` on gfx908/gfx1100 with `k=1` after enabling the hipCUB path. Do not
+    blind-cherry-pick it — re-check its current review state before porting, and test the
+    `k=1` edge case explicitly on this box's gfx1151 target even if upstream's gfx908/gfx1100
+    segfault doesn't reproduce here.
+  - **Known risk on this exact GPU family**: upstream issue #26746 reports a *crash* (not
+    just a CPU fallback) in `GGML_OP_TOP_K` on gfx1151 with DeepSeek-V4-Flash during long
+    prefill (past 4096 tokens), open and unconfirmed. Test for this specifically after any
+    hipCUB port, on this box, before considering the fix complete — a port that trades "slow"
+    for "crashes past 4096 tokens" is not an improvement.
+  - **Before implementing**: re-run the investigation doc's revised next step (long-context
+    `GGML_SCHED_DEBUG=2 -v` test past 1024 and 4096 tokens) to directly confirm this mechanism
+    fires on this box's actual build, rather than porting a fix for a mechanism only confirmed
+    by code-reading + upstream reports so far, not this box's own runtime evidence yet.
 - **If it's `GGML_OP_LIGHTNING_INDEXER`**: it already has a HIP-compiled generic vector
   kernel (`lightning_indexer_kernel_vec` in `ggml/src/ggml-cuda/lightning-indexer.cu:244`),
   so it should NOT be landing on CPU — if it is, that's a `supports_op` bug to fix directly
@@ -25,13 +51,11 @@ If `GGML_SCHED_DEBUG=2` shows a specific op consistently on the CPU backend duri
   a Vulkan or HIP Lightning Indexer kernel for gfx1151 that can be ported/adapted instead of
   starting from scratch. Porting a working implementation is much lower risk than writing a
   new rocWMMA kernel from the NVIDIA WMMA reference.
-- **If it's `GGML_OP_TOP_K` or `GGML_OP_SET_ROWS`** (used every decode step in
-  `build_top_k_mask`/`build_lid_top_k`): check whether these ops have HIP kernels at all in
-  `ggml/src/ggml-cuda/`. If missing, this is the highest-value narrow fix — these are small,
-  well-defined ops (not fused megakernels), so a CPU->HIP port is tractable and low-risk. Grep
-  `ggml/src/ggml-cuda/*.cu` for `top-k` / `set-rows` files before assuming a from-scratch
-  write is needed — llama.cpp upstream may already carry a HIP kernel for these under a
-  slightly different name.
+- **If it's `GGML_OP_SET_ROWS`** (used every decode step in `build_top_k_mask`/
+  `build_lid_top_k` alongside TOP_K above): check whether it has a HIP kernel at all in
+  `ggml/src/ggml-cuda/`. Lower priority than TOP_K above now that TOP_K has a confirmed,
+  specific cause — only chase this if the long-context re-test still shows CPU nodes after
+  a TOP_K/ARGSORT fix is in place.
 - **If it's `mul_mat`/`mul_mat_id` on `IQ2_XXS`/`Q2_K` expert tensors**: check ggml's AMD
   kernel-selection logic (`mmq.cu`, `mmvq.cu`, and the `GGML_CUDA_CC_*` / architecture
   dispatch tables) for gfx1151 (RDNA3.5) coverage of these specific quant types. If HIP

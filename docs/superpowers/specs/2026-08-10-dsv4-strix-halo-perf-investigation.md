@@ -202,3 +202,78 @@ are CPU-bound during decode (with `GGML_SCHED_DEBUG` evidence), whether prefill 
 separate cause, and a ranked list of suspects for the fix-planning doc
 (`2026-08-10-dsv4-strix-halo-perf-fix.md`) to act on. Do not jump to writing kernels before
 this data exists — the fix doc currently has hypotheses, not a confirmed root cause.
+
+## Findings (2026-08-10 follow-up session, on the actual Strix Halo box)
+
+**Small-context `GGML_SCHED_DEBUG=2` test (`-n 4`, ~5-token prompt, `--load-mode dio`
+required - see note below) showed only 1 CPU-backend node in both the prefill pass and the
+first decode pass** - i.e. no reproduction of the original CPU-100%-all-threads symptom at
+this tiny scale. This is expected, not a refutation, once you read the code below: the
+mechanism only triggers once context depth crosses 1024 tokens, and this test never got
+past ~5.
+
+**Root cause candidate, now confirmed by reading the code (not just inferred from btop):**
+- `ggml/src/ggml-cuda/ggml-cuda.cu:5211-5217` - `supports_op` for `GGML_OP_TOP_K` and
+  `GGML_OP_ARGSORT`:
+  ```cpp
+  case GGML_OP_TOP_K:
+  case GGML_OP_ARGSORT:
+  #ifndef GGML_CUDA_USE_CUB
+      return op->src[0]->ne[0] <= 1024;
+  #else
+      return true;
+  #endif
+  ```
+- `ggml/src/ggml-cuda/common.cuh:110-112` - `GGML_CUDA_USE_CUB` is defined only
+  `!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070`. **HIP never
+  gets this macro**, so on this branch's ROCm/HIP build, `supports_op` for TOP_K/ARGSORT is
+  unconditionally `ne[0] <= 1024` - any row longer than 1024 elements is scheduled onto the
+  **CPU backend entirely**, not a slow GPU kernel. This is a clean, mechanical explanation for
+  "CPU 100% on all 32 threads specifically during decode": once a session's context depth
+  (or whatever dimension feeds the lightning-indexer's `index_topk` selection - `ne[0]` here)
+  passes 1024, every decode step's TOP_K call gets rerouted to `ggml-cpu`, which then
+  multithreads it across all configured threads exactly as observed.
+- `ggml/src/ggml-vulkan/ggml-vulkan.cpp:18270-18295` - Vulkan's `ARGSORT`/`TOP_K` have **no
+  hardcoded 1024 cap**: `ARGSORT` uses a "large" pipeline gated on `vulkan_memory_model`
+  (unbounded when available), and `TOP_K` is gated on a per-size pipeline table
+  (`num_topk_pipelines`), not a fixed ceiling. This is a strong, mechanical explanation for
+  why other Strix Halo users (who report ~250/~11 t/s and, per the sibling-repo survey doc,
+  mostly run Vulkan not ROCm) don't hit this - their backend was never artificially capped at
+  1024 in the first place.
+
+**Independent corroboration from upstream GitHub** (found by the user searching issues, not
+derived from this session's own reasoning):
+- **PR #26592** ("CUDA: Enable CUB path on HIP via hipCUB") - directly targets this exact
+  gap. Its own description: "For DeepSeek-V4-Flash models, any TOP_K operation exceeding 1024
+  context length executed on the CPU... reportedly 6.4x token-generation loss." Same op,
+  same model family, same root cause as derived above independently. **Status: open, blocked**
+  - a reviewer (IMbackK) found segfaults in `test-backend-ops` on gfx908/gfx1100 with `k=1`
+  after enabling the hipCUB path; not yet merged upstream as of 2026-08-10.
+- **Issue #26746** ("ROCm gfx1151 RPC worker crashes in GGML_OP_TOP_K during DeepSeek V4
+  prefill after 4096 tokens") - **same GPU family as this box** (Strix Halo/gfx1151), same
+  model, a *crash* (not just a slow CPU fallback) in the TOP_K kernel path specifically during
+  **prefill** past 4096 tokens. This is a second, separate TOP_K-related problem on the exact
+  same hardware - open, unconfirmed, no fix yet. Relevant caveat for the "prefill is clean"
+  observation in this doc: that observation was made with the user's real session at
+  whatever context depth was active at the time, not verified across the 1024/4096-token
+  boundaries - **do not assume prefill is unaffected until re-tested past those thresholds.**
+- **Issue #26820** (RPC backend `[create_node] invalid data ptr` for DeepSeek-V4-Flash on a
+  Windows CPU-only 9-node RPC cluster) - almost certainly **not relevant** here: different
+  failure mode (RPC tensor-buffer deserialization), different hardware (CPU-only, distributed,
+  not a single Strix Halo box), different transport (`rpc-server`, which the user isn't using).
+  Noted so a future agent doesn't waste time chasing it as a lead.
+
+**Load-mode note (new, unplanned finding):** the user could not get the model to load at all
+*without* `--load-mode dio` - it stayed stuck at "Loading model..." with GPU pinned at 100%.
+This is a separate, currently-unexplained problem (default/mmap load path apparently hangs for
+this 91GB model on this box) - out of scope for the decode-CPU-fallback investigation, but
+worth its own follow-up doc/issue before assuming `--load-mode dio` is merely a preference
+rather than a workaround for a load-path bug.
+
+**Revised next step (before writing any fix):** re-run the same `GGML_SCHED_DEBUG=2 -v`
+methodology from the "Investigation steps" section above, but with a **prompt long enough to
+push context depth past 1024 tokens** (and ideally past 4096, to also probe the #26746 crash
+report), and check both the prefill pass(es) and decode passes for `TOP_K`/`ARGSORT` nodes
+landing on the `CPU` backend. This directly confirms or refutes the mechanism above and
+resolves whether prefill is actually clean or was just under-tested, before committing to
+"port PR #26592" as the fix (see updated fix-plan doc).
