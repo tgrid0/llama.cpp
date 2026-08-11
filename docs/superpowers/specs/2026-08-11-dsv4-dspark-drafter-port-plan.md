@@ -1,6 +1,20 @@
 # Bringing DSpark speculative decoding for DeepSeek-V4-Flash to this branch
 
-Status: plan for a future session. No code changes made, nothing downloaded or run yet.
+Status: **DONE, validated on hardware.** Plan B (repack antirez's ds4-quantized DSpark support
+GGUF) shipped as `gguf-py/gguf/scripts/dsv4_dspark_repack.py`. Confirmed 2026-08-11 on Strix
+Halo (gfx1151): loads via `--spec-draft-model <repacked>.gguf --spec-type draft-dspark`,
+DeepSeek-V4-Flash-0731 decode speed went from 11 t/s to 20-22 t/s. Plan A (raw HF conversion)
+was never attempted - Plan B worked first try (after one metadata bug fix, see below), no
+reason to chase the larger download. One bug found and fixed during validation: several DSV4
+hparams are per-layer arrays sized to the TARGET's block_count (43) -
+`swiglu_clamp_exp`/`swiglu_clamp_shexp`, and generically `feed_forward_length`/
+`attention.head_count`/`attention.head_count_kv` - copying them verbatim into the drafter's
+GGUF fails to load ("wrong array length") because llama.cpp checks array length against the
+*loading* model's own layer count (the drafter's 3 stages, not the target's 43). Fixed by
+detecting any array whose length matches the target's block_count and collapsing it to the
+drafter's stage count (verified all-equal first, per DeepSeek's own convention of repeating a
+single value uniformly per layer).
+
 Written by comparing this branch's own `src/models/dflash.cpp` against the sibling project
 `W:\projects\llm\ds4` (dwarfstar4, "ds4" — a from-scratch C inference engine for DeepSeek-V4,
 not based on llama.cpp, written by the same author who publishes the `antirez/deepseek-v4-gguf`
