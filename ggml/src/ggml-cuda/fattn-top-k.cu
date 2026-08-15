@@ -45,6 +45,7 @@ static __global__ void flash_attn_ext_top_k(
     float row_sum = 0.0f;
 
     const float * q_row    = q    + (int64_t) stream*nbq3 + (int64_t) head*nbq2 + (int64_t) token*nbq1;
+    const half  * k_str    = k    + (int64_t) stream*nbk3;
     const half  * mask_row = mask + (int64_t) stream*nbm3 + (int64_t) token*nbm1;
     const int   * top_row  = top_k + (int64_t) stream*nbt3 + (int64_t) token*nbt1;
 
@@ -73,7 +74,7 @@ static __global__ void flash_attn_ext_top_k(
             const int col = idx / DSV4_HEAD_SIZE;
             const int dim = idx % DSV4_HEAD_SIZE;
             const int key = key_idx[col];
-            key_sh[idx] = key < n_kv ? k[(int64_t) key*nbk1 + dim] : __float2half(0.0f);
+            key_sh[idx] = key < n_kv ? k_str[(int64_t) key*nbk1 + dim] : __float2half(0.0f);
         }
         __syncthreads();
 
@@ -154,7 +155,9 @@ bool ggml_cuda_flash_attn_ext_top_k_supported(const ggml_tensor * dst) {
         Q->ne[0] != DSV4_HEAD_SIZE || K->ne[0] != DSV4_HEAD_SIZE || V->ne[0] != DSV4_HEAD_SIZE ||
         Q->ne[1] < 64 || Q->ne[2] != 64 || K->ne[2] != 1 || V->ne[2] != 1 ||
         K->data != V->data || K->ne[1] != V->ne[1] ||
-        !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k)) {
+        !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k) ||
+        mask->ne[2] != 1 ||
+        mask->ne[3] != Q->ne[3] || top_k->ne[3] != Q->ne[3]) {
         return false;
     }
 
