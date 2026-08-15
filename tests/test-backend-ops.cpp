@@ -433,6 +433,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR14(a, b, c, d, e, f, g, h, i, j, k, l, m, n) VAR_TO_STR(a) + "," + VARS_TO_STR13(b, c, d, e, f, g, h, i, j, k, l, m, n)
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
+#define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 
 #ifdef GGML_USE_SYCL
 static bool inline _isinf(float f) {
@@ -6819,6 +6820,9 @@ struct test_flash_attn_ext : public test_case {
 
     const bool mask; // use mask
     const bool sinks; // use sinks
+    const bool top_k; // use the sparse-attention top_k hint (mask must also be true)
+    const int64_t n_kv_raw; // dense prefix length when top_k is used
+    const int64_t n_top_k; // number of gathered indices when top_k is used (must be <= kv - n_kv_raw)
 
     const float max_bias; // ALiBi
     const float logit_softcap; // Gemma 2
@@ -6829,7 +6833,7 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, top_k, n_kv_raw, n_top_k, max_bias, logit_softcap, prec, type_K, type_V, permute);
     }
 
     double max_nmse_err() override {
@@ -6844,10 +6848,16 @@ struct test_flash_attn_ext : public test_case {
     }
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
-                        bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+                        bool mask = true, bool sinks = false,
+                        float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        bool top_k = false, int64_t n_kv_raw = 0, int64_t n_top_k = 0)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), top_k(top_k), n_kv_raw(n_kv_raw), n_top_k(n_top_k), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+          type_K(type_K), type_V(type_V), permute(permute) {
+        // the hint requires the mask fallback to still encode the selection, and a valid,
+        // genuinely sparse (non-empty, in-range) index count
+        GGML_ASSERT(!top_k || (mask && n_top_k > 0 && n_kv_raw >= 0 && n_kv_raw + n_top_k <= kv));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6879,14 +6889,10 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
-            // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
-
-            // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
-            // for more info:
-            //   - https://github.com/ggml-org/llama.cpp/pull/13435
-            //   - https://github.com/ggml-org/llama.cpp/pull/18953#issuecomment-3774948392
-            //   - https://github.com/ggml-org/llama.cpp/pull/18986
+        if (top_k || (type_K == type_V && hsk_padded == 576 && hsv_padded == 512)) {
+            // in this branch, the V cache is sub-view of the K cache. this is used by some
+            // MLA-based models, and required whenever the sparse-attention top_k hint is used
+            // since DeepSeek V4's CSA attention passes the same tensor as both K and V.
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
             v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
@@ -6905,8 +6911,17 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
+        ggml_tensor * tk = nullptr;
+        if (top_k) {
+            tk = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, nr23[1]);
+            ggml_set_name(tk, "top_k");
+        }
+
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
+        if (tk) {
+            ggml_flash_attn_ext_add_top_k(out, tk, n_kv_raw);
+        }
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
 
@@ -6914,12 +6929,23 @@ struct test_flash_attn_ext : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "top_k") == 0) {
+                const int64_t n_compressed = kv - n_kv_raw;
+                const int64_t nels = ggml_nelements(t);
+                std::vector<int32_t> data(nels);
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_compressed - 1);
+                for (int64_t i = 0; i < nels; i++) {
+                    data[i] = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -9617,6 +9643,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // DeepSeek V4 CSA sparse-attention prefill: head_dim 512, 64 query heads over a single KV
+    // head (nh=1, nr23={64,1} -> q heads = nh*nr23[0] = 64, k/v heads = nh = 1), K==V latent.
+    // n_kv_raw=256 dense prefix + n_top_k=2048 gathered, kv=16384 total: comfortably past the
+    // fast kernel's 3x-active-window gate (3*(256+2048) = 6912 <= 16384), so this actually
+    // dispatches to the sparse kernel on ROCm0/CUDA0, not just the dense CPU fallback.
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            512, 512, 1, {64, 1}, 16384, 128, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3},
+            true, 256, 2048));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
