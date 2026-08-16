@@ -1068,6 +1068,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f16;
     vk_pipeline pipeline_lightning_indexer_cm_f16;
     vk_pipeline pipeline_lightning_indexer_cm_small_f16;
+    vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1870,6 +1871,14 @@ struct vk_op_lightning_indexer_push_constants {
     uint32_t nbm1, nbm3;
 };
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+
+struct vk_op_flash_attn_top_k_push_constants {
+    uint32_t n_batch, n_kv, n_kv_raw, n_top_k, n_head;
+    uint32_t nbq1, nbq2, nbq3, nbk1, nbk3, nbm1, nbm3, nbt1, nbt3, nb1, nb2, nb3;
+    float scale;
+    uint32_t has_sinks, split_mode;
+};
+static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
 
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd, hc, nr;
@@ -5935,6 +5944,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 #endif
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
+            "flash_attn_top_k_f16", flash_attn_top_k_f16_len, flash_attn_top_k_f16_data, "main", 6,
+            sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
+            device->subgroup_size);
     }
 
     // DSv4 fused hyper-connection ops: plain f32 compute, no subgroup/coopmat requirements
@@ -10798,6 +10811,88 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// DSv4 CSA sparse top-k flash-attention fast path (scalar only): attends over a dense
+// prefix (n_kv_raw) plus a gathered sparse set (top_k) instead of the full KV cache.
+// Returns false whenever the hint is absent or the shape/dtype gate doesn't match, in
+// which case the caller falls through to the normal dense FA path below unchanged.
+static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                      const ggml_tensor * q, const ggml_tensor * k,
+                                      const ggml_tensor * v, const ggml_tensor * mask,
+                                      ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[5];
+    if (top_k == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (!ctx->device->pipeline_flash_attn_top_k_f16 ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
+        q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 ||
+        q->ne[1] < 64 || q->ne[2] != 64 ||
+        k->ne[2] != 1 || v->ne[2] != 1 ||
+        q->ne[1] != top_k->ne[1] || q->ne[3] != top_k->ne[3] ||
+        k->ne[1] != v->ne[1] || k->buffer != v->buffer || k->data != v->data ||
+        !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k)) {
+        return false;
+    }
+
+    float scale         = 0.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    const int32_t n_kv_raw = ggml_get_op_params_i32(dst, 4);
+    if (n_kv_raw < 0 || n_kv_raw > k->ne[1] || top_k->ne[0] > k->ne[1] - n_kv_raw) {
+        return false;
+    }
+
+    // Crossover against dense FA. This scalar kernel has no coopmat2 pipeline yet (that's
+    // Task 4), so it keeps a fixed 3x margin, matching the already-reviewed HIP kernel's
+    // gate rather than beta3's variable threshold (which assumes a coopmat path exists).
+    const int64_t n_kv_active = n_kv_raw + top_k->ne[0];
+    if (k->ne[1] < 3 * n_kv_active) {
+        return false;
+    }
+
+    const vk_op_flash_attn_top_k_push_constants pc = {
+        (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) n_kv_raw,
+        (uint32_t) top_k->ne[0], (uint32_t) q->ne[2],
+        (uint32_t) (q->nb[1] / sizeof(float)),
+        (uint32_t) (q->nb[2] / sizeof(float)),
+        (uint32_t) (q->nb[3] / sizeof(float)),
+        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
+        (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
+        (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
+        (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[2] / sizeof(float)),
+        (uint32_t) (dst->nb[3] / sizeof(float)),
+        scale, sinks != nullptr, /* split_mode */ 0u,
+    };
+
+    const vk_subbuffer q_buf     = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+
+    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_top_k_f16;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
+         ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], 8u), (uint32_t) q->ne[3]});
+
+    return true;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -10849,6 +10944,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+
+    if (ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, dst)) {
+        return;
+    }
+
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
     uint32_t workgroups_x = (uint32_t)neq1;
