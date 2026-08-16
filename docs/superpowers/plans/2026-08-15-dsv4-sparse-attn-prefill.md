@@ -210,15 +210,22 @@ EOF
 - Consumes: `ggml_flash_attn_ext_add_top_k` (Task 1), the DSV4 CSA shape assumptions from the design doc (head_dim 512, 64 heads, K==V).
 - Produces: two registered `test_flash_attn_ext` cases (F16 and Q8_0 K) that exercise the top_k-hinted path. These are what Task 5's build must pass on the `ROCm0` backend.
 
-- [ ] **Step 1: Add `top_k`/`n_kv_raw` fields to `test_flash_attn_ext`**
+- [ ] **Step 1: Add `top_k`/`n_kv_raw`/`n_top_k` fields to `test_flash_attn_ext`, and a `VARS_TO_STR17` macro**
 
-In `tests/test-backend-ops.cpp`, extend the struct (around line 6812-6850):
+The existing `VARS_TO_STR*` family (near line 429-435) tops out at `VARS_TO_STR16`. Add one more, immediately after the existing `VARS_TO_STR16` definition, following its exact pattern:
+
+```cpp
+#define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
+```
+
+In `tests/test-backend-ops.cpp`, extend the `test_flash_attn_ext` struct (around line 6812-6850):
 
 ```cpp
     const bool mask; // use mask
     const bool sinks; // use sinks
     const bool top_k; // use the sparse-attention top_k hint (mask must also be true)
     const int64_t n_kv_raw; // dense prefix length when top_k is used
+    const int64_t n_top_k; // number of gathered indices when top_k is used (must be <= kv - n_kv_raw)
 
     const float max_bias; // ALiBi
     const float logit_softcap; // Gemma 2
@@ -229,33 +236,50 @@ In `tests/test-backend-ops.cpp`, extend the struct (around line 6812-6850):
     std::array<int32_t, 4> permute;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, top_k, n_kv_raw, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, top_k, n_kv_raw, n_top_k, max_bias, logit_softcap, prec, type_K, type_V, permute);
     }
 ```
 
-(`VARS_TO_STR16` - check the existing `VARS_TO_STR*` macro family in this file and use whichever N matches the new total field count; the file already defines these up to a high count, so this is a mechanical rename from `VARS_TO_STR14` to the next one covering 16 fields.)
-
-Update the constructor to accept the two new parameters with backward-compatible defaults, inserted right after `sinks`:
+Update the constructor to accept the three new parameters with backward-compatible defaults, inserted right after `sinks`:
 
 ```cpp
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
-                        bool mask = true, bool sinks = false, bool top_k = false, int64_t n_kv_raw = 0,
+                        bool mask = true, bool sinks = false, bool top_k = false, int64_t n_kv_raw = 0, int64_t n_top_k = 0,
                         float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), top_k(top_k), n_kv_raw(n_kv_raw), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), top_k(top_k), n_kv_raw(n_kv_raw), n_top_k(n_top_k), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute) {
-        GGML_ASSERT(!top_k || mask); // the hint requires the mask fallback to still encode the selection
+        // the hint requires the mask fallback to still encode the selection, and a valid,
+        // genuinely sparse (non-empty, in-range) index count
+        GGML_ASSERT(!top_k || (mask && n_top_k > 0 && n_kv_raw >= 0 && n_kv_raw + n_top_k <= kv));
     }
 ```
 
-- [ ] **Step 2: Build the top_k tensor and call the hint in `build_graph`**
+**Note on `nh`/`nr23` for MQA shapes (relevant to Step 4 below):** in `build_graph`, `q`'s head count is `nh*nr23[0]` while `k`/`v`'s head count is `nh` directly - so the query:KV head ratio (GQA/MQA ratio) is controlled by `nr23[0]`, not `nh`. To get DeepSeek V4's 64 query heads over a single KV head, use `nh=1, nr23={64, 1}` (q heads = 1*64 = 64, k/v heads = 1) - not `nh=64, nr23={1,1}` (which would build 64 separate KV heads, i.e. plain MHA, and fail the kernel's `K->ne[2] == 1` gate).
 
-In the same struct's `build_graph` (around line 6852-6914), right after the existing `sinks` tensor construction and before `ggml_flash_attn_ext`, add:
+- [ ] **Step 2: Alias V onto K when top_k is used, build the top_k tensor, and call the hint in `build_graph`**
+
+DeepSeek V4's real CSA attention passes the same tensor as both K and V (`build_csa_lid_attention` calls `build_attn_mha(q, k_all, k_all, ...)`), and the kernel's dispatch gate (Task 4) requires `K->data == V->data`. The existing `v` construction in `build_graph` (around line 6881-6893) only aliases V onto K for one specific hardcoded shape (`hsk_padded == 576 && hsv_padded == 512`, an unrelated MLA case). Extend that condition to also alias when `top_k` is set, rather than broadening the hardcoded shape check (which would silently change already-registered, unrelated test cases at hsk=hsv=512):
+
+```cpp
+        ggml_tensor * v = nullptr;
+        if (top_k || (type_K == type_V && hsk_padded == 576 && hsv_padded == 512)) {
+            // in this branch, the V cache is sub-view of the K cache. this is used by some
+            // MLA-based models, and required whenever the sparse-attention top_k hint is used
+            // since DeepSeek V4's CSA attention passes the same tensor as both K and V.
+            v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+        } else {
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+        }
+```
+
+(Only the `if` condition changes - the two branch bodies are unchanged from the existing code.)
+
+Right after the existing `sinks` tensor construction and before `ggml_flash_attn_ext`, add:
 
 ```cpp
         ggml_tensor * tk = nullptr;
         if (top_k) {
-            const int64_t n_top_k = kv - n_kv_raw;
             tk = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, nr23[1]);
             ggml_set_name(tk, "top_k");
         }
@@ -311,12 +335,14 @@ In the same struct's `initialize_tensors` override (around line 6916-6927), add 
 Near line 9616 (alongside the other large-KV FA cases such as `test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, ...))`), add:
 
 ```cpp
-    // DeepSeek V4 CSA sparse-attention prefill: head_dim 512, 64-head MQA, K==V latent.
-    // n_kv_raw=256 dense prefix + n_top_k=2048 gathered, kv=16384 total (well past the 3x
-    // active-window threshold the fast kernel gates on - see the design doc).
+    // DeepSeek V4 CSA sparse-attention prefill: head_dim 512, 64 query heads over a single KV
+    // head (nh=1, nr23={64,1} -> q heads = nh*nr23[0] = 64, k/v heads = nh = 1), K==V latent.
+    // n_kv_raw=256 dense prefix + n_top_k=2048 gathered, kv=16384 total: comfortably past the
+    // fast kernel's 3x-active-window gate (3*(256+2048) = 6912 <= 16384), so this actually
+    // dispatches to the sparse kernel on ROCm0/CUDA0, not just the dense CPU fallback.
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_flash_attn_ext(
-            512, 512, 64, {1, 1}, 16384, 128, true, false, true, 256, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+            512, 512, 1, {64, 1}, 16384, 128, true, false, true, 256, 2048, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
     }
 ```
 

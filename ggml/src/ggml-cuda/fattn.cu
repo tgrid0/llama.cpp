@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
+#include "fattn-top-k.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
@@ -333,6 +334,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_TOP_K   = 900,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -360,6 +362,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
+
+    if (ggml_cuda_flash_attn_ext_top_k_supported(dst) && ggml_cuda_info().devices[device].warp_size == 32) {
+        return BEST_FATTN_KERNEL_TOP_K;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -557,6 +563,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_TOP_K:
+            need_f16_K = K->type != GGML_TYPE_F16;
+            need_f16_V = false; // V shares K's buffer for this op (see design doc)
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -580,6 +590,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TOP_K:
+            ggml_cuda_flash_attn_ext_top_k(ctx, dst);
             break;
     }
 }
