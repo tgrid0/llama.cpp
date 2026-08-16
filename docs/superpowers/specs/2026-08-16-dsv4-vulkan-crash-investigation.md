@@ -183,7 +183,33 @@ Same workload both times - this is the exact `llama-server` invocation that was 
 crash, with `--ctx-size 65536` (the smaller of the two contexts that crashed - start here; only
 move to `--ctx-size 1048576` if 65536 succeeds on Build B). Set `GGML_VK_MEMORY_LOGGER=1` in the
 environment and redirect stderr to a log file (the memory-debug lines and all `GGML_LOG_*` output
-go to stderr):
+go to stderr). You will need **two terminals**: one for the `llama-server` command (it runs in
+the foreground, piped through `tee`), one to send the crash-trigger request into it.
+
+For each build below, follow the numbered steps in order - **start the server, send the request,
+look at the result, only then stop the server** - before moving on to the other build. Stopping the
+server before sending it a request is the one thing to avoid: an idle server that never saw a
+long prompt tells you nothing, since the crash was reported during prefill, not at startup.
+
+Generate the crash-trigger request once, now, before starting either server - it's reused
+unchanged for both builds. This is a filler prompt long enough to approach `--ctx-size 65536`,
+built into a JSON chat-completions payload with `jq` (handles escaping so you don't have to
+hand-quote 200KB of text):
+
+```bash
+# ~60k tokens of filler text (rough estimate for English prose: ~4 chars/token, so ~240000 chars;
+# for --ctx-size 1048576 scale the repeat count by 16x, e.g. 96000 instead of 6000):
+python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 6000)" > /tmp/vk-crash-prompt.txt
+wc -c /tmp/vk-crash-prompt.txt
+
+jq -n --rawfile prompt /tmp/vk-crash-prompt.txt \
+  '{model: "antirez/ds4flash-284b-a13b-q2", messages: [{role: "user", content: $prompt}], max_tokens: 64, stream: false}' \
+  > /tmp/vk-crash-request.json
+```
+
+#### Build A ("before")
+
+**Step 1 - start the server**, in terminal 1:
 
 ```bash
 GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-before/bin/llama-server" --port 8090 \
@@ -217,11 +243,31 @@ GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-before/bin/llama-server" --port 8090 \
   2>&1 | tee /tmp/vk-crash-before-ctx65536.log
 ```
 
-**Stop the first server before starting the second one** - both bind the same port (8090) and
-only one can run at a time. Go back to the terminal running `build-vk-before/bin/llama-server`
-(or the crashed/finished command above) and press Ctrl-C to make sure it has exited, then repeat
-identically against `build-vk-after/bin/llama-server`, logging to
-`/tmp/vk-crash-after-ctx65536.log`:
+**Step 2 - wait for it to finish loading**, watching terminal 1 for the "server is listening"
+line.
+
+**Step 3 - from terminal 2, send the crash-trigger request** (built once, above) to the
+chat-completions endpoint on port 8090:
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d @/tmp/vk-crash-request.json
+```
+
+**Step 4 - observe the result**, in both terminals. If `curl` returns a normal completion, the
+request went through cleanly - note that in your results. If the server process dies mid-request,
+`curl` will show a connection-reset/empty-reply error in terminal 2, and the crash itself
+(the pinned-memory warning and/or the `ErrorDeviceLost`/`device lost` lines from Step 1) will
+appear in terminal 1, captured by `tee` into `/tmp/vk-crash-before-ctx65536.log`.
+
+**Step 5 - stop the server**, only now: go back to terminal 1 and press Ctrl-C (skip this if the
+server already crashed and the process has already exited). Build B binds the same port (8090),
+so Build A's server must not still be holding it.
+
+#### Build B ("after")
+
+**Step 1 - start the server**, in terminal 1:
 
 ```bash
 GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-after/bin/llama-server" --port 8090 \
@@ -255,38 +301,27 @@ GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-after/bin/llama-server" --port 8090 \
   2>&1 | tee /tmp/vk-crash-after-ctx65536.log
 ```
 
-For each run, once the server has finished loading (watch for the "server is listening" line in
-the terminal running the command above), **open a second terminal** - the server above runs in
-the foreground, piped through `tee`, so it needs the terminal it's in - and send it one
-prefill-heavy request from there. The crash was reported during prefill, not idle startup, so an
-idle/clean-startup server does not rule anything out; you need to actually push a long prompt
-through it.
+**Step 2 - wait for it to finish loading**, watching terminal 1 for the "server is listening"
+line.
 
-Generate a filler prompt long enough to approach `--ctx-size 65536`, build the JSON request with
-`jq` (handles escaping so you don't have to hand-quote 200KB of text), and POST it to the
-chat-completions endpoint on port 8090:
+**Step 3 - from terminal 2, send the same crash-trigger request** used against Build A (the
+files are unchanged, no need to regenerate them):
 
 ```bash
-# ~60k tokens of filler text (rough estimate for English prose: ~4 chars/token, so ~240000 chars;
-# for --ctx-size 1048576 scale the repeat count by 16x, e.g. 96000 instead of 6000):
-python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 6000)" > /tmp/vk-crash-prompt.txt
-wc -c /tmp/vk-crash-prompt.txt
-
-jq -n --rawfile prompt /tmp/vk-crash-prompt.txt \
-  '{model: "antirez/ds4flash-284b-a13b-q2", messages: [{role: "user", content: $prompt}], max_tokens: 64, stream: false}' \
-  > /tmp/vk-crash-request.json
-
 curl -s -X POST http://127.0.0.1:8090/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @/tmp/vk-crash-request.json
 ```
 
-Run this same three-command block (regenerating the prompt file isn't necessary between runs -
-reuse `/tmp/vk-crash-prompt.txt` and `/tmp/vk-crash-request.json`) against each of the two servers
-in turn, from the second terminal, while the first terminal's `tee` log captures the server-side
-output. If `curl` returns a normal completion, the request went through cleanly; if the server
-process dies mid-request, `curl` will show a connection-reset/empty-reply error and the crash
-should appear in the first terminal's log.
+**Step 4 - observe the result**, same as Build A: a normal completion means the request went
+through cleanly; a connection-reset/empty-reply in terminal 2 plus `ErrorDeviceLost`/`device
+lost` lines in terminal 1 (captured into `/tmp/vk-crash-after-ctx65536.log`) means it crashed.
+
+**Step 5 - stop the server**: Ctrl-C in terminal 1 (skip if it already crashed). You're done with
+both builds at this context size - move on to comparing the two logs below, then retest Build B
+at `--ctx-size 1048576` if Step 4 showed it completed cleanly at 65536 (rerun this whole Build B
+sequence with `--ctx-size 1048576` substituted in the server command and a scaled-up prompt, per
+the note above the filler-text command).
 
 ### 2.4 Compare the two logs
 
