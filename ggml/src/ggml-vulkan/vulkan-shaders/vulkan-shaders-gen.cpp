@@ -798,6 +798,9 @@ void process_shaders() {
     string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
 #endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("flash_attn_top_k_cm_f16", "flash_attn_top_k_cm.comp", {});
+#endif
 
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});

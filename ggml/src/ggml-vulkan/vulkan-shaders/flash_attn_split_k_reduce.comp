@@ -13,7 +13,10 @@ layout (binding = 2) writeonly buffer D {float data_d[];};
 layout (push_constant) uniform parameter {
     uint D;
     uint ne1;
+    // ne2 sizes the split buffer, which may cover only a tile of the queries. dst_ne2 is the
+    // full query count and is what the destination stride between streams must use.
     uint ne2;
+    uint dst_ne2;
     uint ne3;
     uint k_num;
     uint sinks;
@@ -116,6 +119,6 @@ void main() {
         const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
         O = clamp(O, -FLT_MAX, FLT_MAX);
 
-        data_d[(i3 * p.ne2 + i2) * p.ne1 * D + D * n + d] = O;
+        data_d[(i3 * p.dst_ne2 + i2) * p.ne1 * D + D * n + d] = O;
     }
 }

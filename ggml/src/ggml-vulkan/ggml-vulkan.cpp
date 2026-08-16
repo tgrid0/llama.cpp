@@ -1069,6 +1069,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_cm_f16;
     vk_pipeline pipeline_lightning_indexer_cm_small_f16;
     vk_pipeline pipeline_flash_attn_top_k_f16;
+    vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -2059,7 +2060,10 @@ struct vk_quantize_q8_1_push_constants {
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
+    // ne2 sizes the split buffer, which may cover only a tile of the queries. dst_ne2 is the
+    // full query count and is what the destination stride between streams must use.
     uint32_t ne2;
+    uint32_t dst_ne2;
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;
@@ -5942,6 +5946,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     sizeof(vk_op_lightning_indexer_push_constants), {128, 16, 1}, {device->subgroup_size}, 1, true, true,
                     device->subgroup_size);
             }
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
+                "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
+                sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
+                device->subgroup_size);
         }
 #endif
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
@@ -10811,10 +10819,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
-// DSv4 CSA sparse top-k flash-attention fast path (scalar only): attends over a dense
-// prefix (n_kv_raw) plus a gathered sparse set (top_k) instead of the full KV cache.
-// Returns false whenever the hint is absent or the shape/dtype gate doesn't match, in
-// which case the caller falls through to the normal dense FA path below unchanged.
+// DSv4 CSA sparse top-k flash-attention fast path: attends over a dense prefix (n_kv_raw)
+// plus a gathered sparse set (top_k) instead of the full KV cache. Returns false whenever
+// the hint is absent or the shape/dtype gate doesn't match, in which case the caller falls
+// through to the normal dense FA path below unchanged.
 static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
                                       const ggml_tensor * q, const ggml_tensor * k,
                                       const ggml_tensor * v, const ggml_tensor * mask,
@@ -10826,7 +10834,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_tensor * sinks = dst->src[4];
 
-    if (!ctx->device->pipeline_flash_attn_top_k_f16 ||
+    if ((!ctx->device->pipeline_flash_attn_top_k_f16 && !ctx->device->pipeline_flash_attn_top_k_cm_f16) ||
         q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 ||
@@ -10853,15 +10861,18 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
         return false;
     }
 
-    // Crossover against dense FA. This scalar kernel has no coopmat2 pipeline yet (that's
-    // Task 4), so it keeps a fixed 3x margin, matching the already-reviewed HIP kernel's
-    // gate rather than beta3's variable threshold (which assumes a coopmat path exists).
+    // Crossover against dense FA. The coopmat path (and especially the raw/selected split
+    // below) is cheap enough to win as soon as any key is pruned. The scalar fallback is
+    // not, and regresses against dense FA until the pruned fraction is large, so it keeps
+    // the 3x margin. Equality always uses dense FA because nothing is pruned.
     const int64_t n_kv_active = n_kv_raw + top_k->ne[0];
-    if (k->ne[1] < 3 * n_kv_active) {
+    const bool have_cm_sparse = ctx->device->pipeline_flash_attn_top_k_cm_f16 != nullptr;
+    const int64_t min_total_k = have_cm_sparse ? n_kv_active + 1 : 3 * n_kv_active;
+    if (k->ne[1] < min_total_k) {
         return false;
     }
 
-    const vk_op_flash_attn_top_k_push_constants pc = {
+    vk_op_flash_attn_top_k_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) n_kv_raw,
         (uint32_t) top_k->ne[0], (uint32_t) q->ne[2],
         (uint32_t) (q->nb[1] / sizeof(float)),
@@ -10882,13 +10893,133 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
     const vk_subbuffer q_buf     = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
 
-    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_top_k_f16;
+    static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
+    const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
+    vk_pipeline pipeline = use_cm ? ctx->device->pipeline_flash_attn_top_k_cm_f16 : ctx->device->pipeline_flash_attn_top_k_f16;
+
+    // Split path: run the dense prefix through the ordinary coopmat1 FA shader and only the
+    // selected keys through the sparse shader, then merge both partials with the shared
+    // split-k reduce. Both write the same [O..., L/M...] layout, so no new reduce is needed.
+    static const char * top_k_split_env = getenv("GGML_VK_FA_TOPK_SPLIT");
+    const uint32_t mask_stride = (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t));
+    const bool try_split = use_cm && (!top_k_split_env || top_k_split_env[0] != '0') && n_kv_raw > 0 && top_k->ne[0] > 0;
+    if (try_split) {
+        const uint32_t N  = (uint32_t) q->ne[1];
+        const uint32_t D  = 512;
+        const uint32_t NH = 64;
+        const uint32_t NS = (uint32_t) q->ne[3];
+        const uint32_t raw_kv = (uint32_t) n_kv_raw;
+        const uint32_t partitions = 2;
+        // Query tiling caps the split scratch at 256 queries regardless of batch or stream
+        // count. The reduce takes the tile height as ne2 and the full query count as dst_ne2,
+        // so the destination stream stride stays correct across tiles.
+        const uint32_t tile_size = std::min(N, 256u);
+        const uint32_t n_tiles = CEIL_DIV(N, tile_size);
+        const bool f32acc = true;
+        const vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
+
+        const uint32_t q_stride = (uint32_t) (q->nb[1] / sizeof(float));
+        const uint32_t k_stride = (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t));
+        const bool aligned = raw_kv % tuning.block_cols == 0 && (q_stride & 7) == 0 && (k_stride & 7) == 0;
+        const vk_fa_pipeline_state raw_state = get_fa_pipeline_state(ctx->device, tuning, D, D, aligned, f32acc,
+                                                                    true, false, false, GGML_TYPE_F16, GGML_TYPE_F16);
+        if (raw_state.path == FA_COOPMAT1 && ctx->device->pipeline_flash_attn_split_k_reduce) {
+            vk_pipeline raw_pipeline;
+            {
+                std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+                auto & pipelines = ctx->device->pipeline_flash_attn_f32_f16;
+                auto it = pipelines.find(raw_state);
+                if (it != pipelines.end()) {
+                    raw_pipeline = it->second;
+                } else {
+                    pipelines[raw_state] = raw_pipeline = std::make_shared<vk_pipeline_struct>();
+                }
+            }
+            const uint64_t partition_size = ((uint64_t) D * NH + NH * 2) * sizeof(float) * tile_size * NS;
+            const uint64_t split_size = partition_size * partitions;
+            if (split_size <= ctx->device->properties.limits.maxStorageBufferRange) {
+                ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, n_tiles);
+                ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_tiles);
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, n_tiles);
+                if (ctx->prealloc_size_split_k < split_size) {
+                    ctx->prealloc_size_split_k = split_size;
+                    ggml_vk_preallocate_buffers(ctx, subctx);
+                }
+                if (ctx->prealloc_split_k_need_sync) {
+                    ggml_vk_sync_buffers(ctx, subctx);
+                }
+
+                // ALiBi is disabled (max_bias == 0), so n_head_log2 is never read.
+                const uint32_t n_head_log2 = 0;
+                // The raw dispatch smuggles the mask row stride through split_kv, which the FA
+                // shader also uses to derive its KV range as min(KV, (split_k_index+1)*split_kv).
+                // That is only safe while split_k_index == 0 and the stride covers the whole raw
+                // prefix - both hold here, but assert rather than rely on it silently.
+                GGML_ASSERT(mask_stride >= raw_kv && "split_kv carries the mask stride; it must not clip the raw KV range");
+                const uint32_t packed_gqa = 0x80000000u | 1u;
+                const uint32_t packed_partitions = (partitions << 16) | 1;
+                const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+                const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+                const vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+                const vk_subbuffer top_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
+                const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+                const auto sliced = [](const vk_subbuffer & buf, uint64_t offset) {
+                    return vk_subbuffer{buf.buffer, buf.offset + offset, buf.size - offset};
+                };
+
+                for (uint32_t tile = 0; tile < n_tiles; ++tile) {
+                    if (tile != 0) {
+                        ggml_vk_sync_buffers(ctx, subctx);
+                    }
+                    const uint32_t token_offset = tile * tile_size;
+                    const uint32_t tile_n = std::min(tile_size, N - token_offset);
+                    const vk_subbuffer tile_q = sliced(q_buf, (uint64_t) token_offset * q->nb[1]);
+                    const vk_subbuffer tile_mask = sliced(mask_buf, (uint64_t) token_offset * mask->nb[1]);
+                    const vk_subbuffer tile_top = sliced(top_buf, (uint64_t) token_offset * top_k->nb[1]);
+                    const vk_subbuffer tile_dst = sliced(dst_buf, (uint64_t) token_offset * dst->nb[2]);
+                    const vk_flash_attn_push_constants raw_pc = {
+                        tile_n, raw_kv,
+                        NH, tile_n, NS,
+                        NH, NS,
+                        1, NS,
+                        1, NS,
+                        (uint32_t) mask->ne[1], (uint32_t) mask->ne[2], (uint32_t) mask->ne[3],
+                        q_stride, (uint32_t) q->nb[2], (uint32_t) q->nb[3],
+                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                        scale, 0.0f, 0.0f,
+                        n_head_log2, 1.0f, 1.0f,
+                        packed_gqa, mask_stride, packed_partitions,
+                    };
+
+                    ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
+                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q},
+                        raw_pc, {tile_n, NH, NS});
+
+                    pc.n_batch = tile_n;
+                    pc.split_mode = 1;
+                    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                        {tile_q, k_buf, tile_mask, sinks_buf, tile_top, split_buf},
+                        pc, {tile_n, (uint32_t) CEIL_DIV(q->ne[2], 32), NS});
+
+                    ctx->prealloc_split_k_need_sync = true;
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = { D, NH, tile_n, N, NS, partitions, (sinks != nullptr) };
+                    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                        {split_buf, sinks_buf, tile_dst}, reduce_pc, {NH, D, tile_n * NS});
+                    ctx->prealloc_split_k_need_sync = true;
+                }
+                return true;
+            }
+        }
+    }
+
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
          ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
-        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], 8u), (uint32_t) q->ne[3]});
+        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], use_cm ? 32u : 8u), (uint32_t) q->ne[3]});
 
     return true;
 }
@@ -11174,7 +11305,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
-        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
