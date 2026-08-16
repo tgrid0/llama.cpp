@@ -90,12 +90,15 @@ resolving fused DeepSeek V4 HC support:
 <op name> not supported, set to disabled
 ```
 
-`src/models/deepseek4.cpp` (`build_hc_pre`/`build_hc_comb`/`build_hc_post`, lines ~295, 388, 416,
-672) branches on these flags: when true, it emits a single fused `ggml_dsv4_hc_pre`/`comb`/`post`
-or lightning-indexer op; when false (today's Vulkan situation pre-Task-1), it falls through to a
+`src/models/deepseek4.cpp` branches on these flags in two places: `build_hc_pre`/`build_hc_comb`/
+`build_hc_post` (lines ~295, 388, 416) check `cparams.fused_dsv4_hc_pre`/`comb`/`post`, and the
+lightning-indexer build function separately checks `cparams.fused_lid` at line ~672. When the
+relevant flag is true, the code emits a single fused `ggml_dsv4_hc_pre`/`comb`/`post` or
+lightning-indexer op; when false (today's Vulkan situation pre-Task-1), it falls through to a
 decomposed chain of primitive ops (`dsv4_hc_affine`, `ggml_scale_bias`, mean, a Sinkhorn-iteration
-loop, etc.) - many more, and larger, intermediate tensors per layer per token. This is the exact
-mechanism the hypothesis is about, and it's a clean, greppable signal independent of buffer sizes:
+loop, etc. for HC; a separate primitive chain for the indexer) - many more, and larger,
+intermediate tensors per layer per token. This is the exact mechanism the hypothesis is about,
+and it's a clean, greppable signal independent of buffer sizes:
 **grep each build's startup log for the four lines above.** On the "before" build you should see
 `not supported, set to disabled` for the lightning-indexer and all three HC probes on Vulkan; on
 the "after" build (this branch) you should see `enabled` for all four.
@@ -214,7 +217,10 @@ GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-before/bin/llama-server" --port 8090 \
   2>&1 | tee /tmp/vk-crash-before-ctx65536.log
 ```
 
-Then repeat identically against `build-vk-after/bin/llama-server`, logging to
+**Stop the first server before starting the second one** - both bind the same port (8090) and
+only one can run at a time. Go back to the terminal running `build-vk-before/bin/llama-server`
+(or the crashed/finished command above) and press Ctrl-C to make sure it has exited, then repeat
+identically against `build-vk-after/bin/llama-server`, logging to
 `/tmp/vk-crash-after-ctx65536.log`:
 
 ```bash
@@ -249,11 +255,38 @@ GGML_VK_MEMORY_LOGGER=1 "$REPO/build-vk-after/bin/llama-server" --port 8090 \
   2>&1 | tee /tmp/vk-crash-after-ctx65536.log
 ```
 
-For each run, once the server is up (or has crashed), send one prefill-heavy request to actually
-exercise the crash path - a long-context completion request is enough; the crash was reported
-during prefill, not idle startup. If the server starts and idles cleanly but you want to be sure
-prefill was exercised, send a request with a long enough prompt to approach the configured
-`--ctx-size`.
+For each run, once the server has finished loading (watch for the "server is listening" line in
+the terminal running the command above), **open a second terminal** - the server above runs in
+the foreground, piped through `tee`, so it needs the terminal it's in - and send it one
+prefill-heavy request from there. The crash was reported during prefill, not idle startup, so an
+idle/clean-startup server does not rule anything out; you need to actually push a long prompt
+through it.
+
+Generate a filler prompt long enough to approach `--ctx-size 65536`, build the JSON request with
+`jq` (handles escaping so you don't have to hand-quote 200KB of text), and POST it to the
+chat-completions endpoint on port 8090:
+
+```bash
+# ~60k tokens of filler text (rough estimate for English prose: ~4 chars/token, so ~240000 chars;
+# for --ctx-size 1048576 scale the repeat count by 16x, e.g. 96000 instead of 6000):
+python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 6000)" > /tmp/vk-crash-prompt.txt
+wc -c /tmp/vk-crash-prompt.txt
+
+jq -n --rawfile prompt /tmp/vk-crash-prompt.txt \
+  '{model: "antirez/ds4flash-284b-a13b-q2", messages: [{role: "user", content: $prompt}], max_tokens: 64, stream: false}' \
+  > /tmp/vk-crash-request.json
+
+curl -s -X POST http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d @/tmp/vk-crash-request.json
+```
+
+Run this same three-command block (regenerating the prompt file isn't necessary between runs -
+reuse `/tmp/vk-crash-prompt.txt` and `/tmp/vk-crash-request.json`) against each of the two servers
+in turn, from the second terminal, while the first terminal's `tee` log captures the server-side
+output. If `curl` returns a normal completion, the request went through cleanly; if the server
+process dies mid-request, `curl` will show a connection-reset/empty-reply error and the crash
+should appear in the first terminal's log.
 
 ### 2.4 Compare the two logs
 
@@ -308,9 +341,9 @@ fix (e.g. splitting that tensor's allocation, or an existing `suballocation_bloc
 chunking path not being applied to it) - out of scope for this plan, file as a follow-up.
 
 If neither the total-footprint comparison nor the single-allocation-limit check explains the
-crash, get node-level attribution before going further: rebuild either binary with
-`GGML_VK_SERIALIZE_SUBMISSIONS=1` set at run time (no rebuild needed - it's also a runtime env
-var, `ggml-vulkan.cpp:7141`). This makes `ggml_vk_print_device_lost_info`
+crash, get node-level attribution before going further: rerun either binary (no rebuild needed)
+with `GGML_VK_SERIALIZE_SUBMISSIONS=1` set in the environment - it's also a runtime env var
+(`ggml-vulkan.cpp:7141`). This makes `ggml_vk_print_device_lost_info`
 (`ggml-vulkan.cpp:2226-2235`) report the exact graph node range that was in flight when the
 device was lost, instead of just the device name - that names the specific op to investigate next,
 rather than guessing from the model architecture.
