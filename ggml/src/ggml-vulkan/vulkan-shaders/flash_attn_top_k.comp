@@ -65,7 +65,7 @@ void main() {
 
     // No bounds check: the grid is sized exactly (x = n_batch, y * HEADS_PER_GROUP covers
     // n_head == 64). An early return here would skip the barriers below for part of the
-    // workgroup, which is undefined behavior — do not reintroduce one without restructuring
+    // workgroup, which is undefined behavior - do not reintroduce one without restructuring
     // the barrier flow.
 
     float accum[HEAD_SIZE / LANES];

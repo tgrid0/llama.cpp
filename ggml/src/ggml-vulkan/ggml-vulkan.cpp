@@ -10828,6 +10828,10 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
                                       const ggml_tensor * v, const ggml_tensor * mask,
                                       ggml_tensor * dst) {
     const ggml_tensor * top_k = dst->src[5];
+    static const char * top_k_env = getenv("GGML_VK_FA_TOPK");
+    if (top_k_env && top_k_env[0] == '0') {
+        return false;
+    }
     if (top_k == nullptr) {
         return false;
     }
@@ -10861,13 +10865,15 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
         return false;
     }
 
+    static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
+    const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
+
     // Crossover against dense FA. The coopmat path (and especially the raw/selected split
     // below) is cheap enough to win as soon as any key is pruned. The scalar fallback is
     // not, and regresses against dense FA until the pruned fraction is large, so it keeps
     // the 3x margin. Equality always uses dense FA because nothing is pruned.
     const int64_t n_kv_active = n_kv_raw + top_k->ne[0];
-    const bool have_cm_sparse = ctx->device->pipeline_flash_attn_top_k_cm_f16 != nullptr;
-    const int64_t min_total_k = have_cm_sparse ? n_kv_active + 1 : 3 * n_kv_active;
+    const int64_t min_total_k = use_cm ? n_kv_active + 1 : 3 * n_kv_active;
     if (k->ne[1] < min_total_k) {
         return false;
     }
@@ -10893,8 +10899,6 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
     const vk_subbuffer q_buf     = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
 
-    static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
-    const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline = use_cm ? ctx->device->pipeline_flash_attn_top_k_cm_f16 : ctx->device->pipeline_flash_attn_top_k_f16;
 
     // Split path: run the dense prefix through the ordinary coopmat1 FA shader and only the
@@ -10904,6 +10908,8 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context& 
     const uint32_t mask_stride = (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t));
     const bool try_split = use_cm && (!top_k_split_env || top_k_split_env[0] != '0') && n_kv_raw > 0 && top_k->ne[0] > 0;
     if (try_split) {
+        // flash_attn_split_k_reduce.comp hardcodes the dst stride, so dst must be contiguous.
+        GGML_ASSERT(ggml_is_contiguous(dst));
         const uint32_t N  = (uint32_t) q->ne[1];
         const uint32_t D  = 512;
         const uint32_t NH = 64;

@@ -1,9 +1,9 @@
 #version 450
 
-// DeepSeek V4 fused hyper-connection "comb": build the 4x4 stream-mixing matrix per token —
+// DeepSeek V4 fused hyper-connection "comb": build the 4x4 stream-mixing matrix per token -
 // per-source softmax over scaled+biased logits, then eps-stabilized alternating column/row
 // (sinkhorn) normalization. Port of ggml-cuda/dsv4-hc.cu (hc_comb): one THREAD per token,
-// the whole 4x4 lives in registers. At decode this is a single active thread by design —
+// the whole 4x4 lives in registers. At decode this is a single active thread by design -
 // the fusion's value is collapsing the ~dozen decomposed graph ops (and their intermediate
 // tensors) into one dispatch, not throughput.
 

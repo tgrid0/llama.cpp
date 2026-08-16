@@ -25,6 +25,40 @@ larger intermediate Vulkan buffers at huge `n_kv` than the now-landed fused kern
 This document is the ready-to-run procedure to test that hypothesis, plus the escalation path if
 it doesn't hold.
 
+## Hardware Validation Checklist
+
+This document's Steps 1-4 below are scoped to one specific hypothesis (the OOM/device-lost crash).
+But this branch also touches files shared with every model's dense (non-DSV4) flash-attention on
+Vulkan, not just DeepSeek-V4's sparse path, and that broader risk needs a checklist too - this is
+the only committed artifact from this plan that survives the branch merging into a docs tree, so it
+belongs here rather than in a task report that won't ship with the code. Work through this on the
+Strix Halo box before trusting the branch:
+
+- [ ] Run the full `test-backend-ops -b Vulkan0 -o FLASH_ATTN_EXT` suite, not just the new DSV4
+  top-k shapes. This exercises the many pre-existing non-DSV4 shapes too, which is the real gate
+  here: this branch edits shared dense-FA shader files (`flash_attn_base.glsl`, `flash_attn_cm1.comp`,
+  `flash_attn_cm2.comp`, `flash_attn.comp`, `flash_attn_split_k_reduce.comp`) that every model's
+  flash-attention goes through, so a regression there would affect every model, not just
+  DeepSeek-V4.
+- [ ] Know the env-var knobs available for isolating problems, and what each does:
+  - `GGML_VK_FA_TOPK=0` - master kill-switch, disables the sparse top-k path entirely and falls
+    back to dense flash-attention for every call (added in this fix wave).
+  - `GGML_VK_FA_TOPK_CM=0` - forces the scalar top-k kernel instead of the coopmat2 one.
+  - `GGML_VK_FA_TOPK_SPLIT=0` - disables the split-k tiling path (raw/selected split dispatch).
+  (Names confirmed by grepping `ggml_vk_flash_attn_top_k` in `ggml-vulkan.cpp` - reconfirm there if
+  in doubt, since these can move.)
+- [ ] Known watch items from this plan's implementation, worth specifically checking for rather
+  than just "test thoroughly":
+  - (a) A dense-FA perf-perturbation risk: a codegen shape change to the `m_stride`/`m_row_len`
+    expressions in `flash_attn_base.glsl`. The *value* is provably unchanged for dense callers, but
+    the codegen *shape* is not provably unchanged - only a real device can detect a perf regression
+    here, since it wouldn't show up as a correctness failure.
+  - (b) ~64MB/stream of additional VRAM usage from the new split-k preallocation - worth watching on
+    memory-constrained configs.
+  - (c) The sparse-FA gate does not constrain `mask->ne[2]`/`ne[3]` against Q's. Not reachable via
+    DeepSeek-V4's actual graph today, so not a live bug, but worth knowing if this code is ever
+    reused for a different model.
+
 ## Step 1: Confirm the crash site is two separate things (do not re-litigate this)
 
 There are two distinct Vulkan failure points in the logs, and they must not be confused:
@@ -317,6 +351,16 @@ curl -s -X POST http://127.0.0.1:8090/v1/chat/completions \
 through cleanly; a connection-reset/empty-reply in terminal 2 plus `ErrorDeviceLost`/`device
 lost` lines in terminal 1 (captured into `/tmp/vk-crash-after-ctx65536.log`) means it crashed.
 
+Build B is the first execution of all four new Vulkan kernel families (Lightning Indexer,
+DeepSeek V4 HC pre/comb/post, flash-attn top-k) on real hardware, so "didn't crash" and "produced
+correct output" are separate claims - a clean exit code does not rule out a wrong-answer kernel
+bug. If Build B completes the request, also eyeball the completion text for basic coherence (not
+garbled, not repetitive, not nonsensical). As a correctness control, rerun the same request against
+Build B with `GGML_VK_FA_TOPK=0` set (forces the dense flash-attention fallback instead of the new
+sparse top-k path) and compare the two outputs. If they diverge meaningfully, that points to a
+correctness bug in one of the new kernels, separate from the crash investigation this doc is
+otherwise scoped to.
+
 **Step 5 - stop the server**: Ctrl-C in terminal 1 (skip if it already crashed). You're done with
 both builds at this context size - move on to comparing the two logs below, then retest Build B
 at `--ctx-size 1048576` if Step 4 showed it completed cleanly at 65536 (rerun this whole Build B
@@ -326,8 +370,8 @@ the note above the filler-text command).
 ### 2.4 Compare the two logs
 
 ```bash
-grep -E "resolving fused|enabled|not supported, set to disabled" /tmp/vk-crash-before-ctx65536.log
-grep -E "resolving fused|enabled|not supported, set to disabled" /tmp/vk-crash-after-ctx65536.log
+grep -E "resolving fused|Lightning Indexer|DeepSeek V4 HC|not supported, set to disabled" /tmp/vk-crash-before-ctx65536.log
+grep -E "resolving fused|Lightning Indexer|DeepSeek V4 HC|not supported, set to disabled" /tmp/vk-crash-after-ctx65536.log
 
 grep "ggml_vk_preallocate_buffers" /tmp/vk-crash-before-ctx65536.log | tail -20
 grep "ggml_vk_preallocate_buffers" /tmp/vk-crash-after-ctx65536.log | tail -20
