@@ -2593,6 +2593,22 @@ public:
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
+        // the actual ggml_backend_tensor_get() call is deferred to the destructor (see below),
+        // where a failure can no longer be reported to the caller and would hit a hard
+        // GGML_ASSERT instead - so validate eagerly here, while we can still throw and let
+        // state_seq_get_data()/state_get_data() turn this into a graceful, logged failure
+        if (size > 0 && tensor->data == nullptr) {
+            std::string msg = std::string("tensor '") + ggml_get_name(tensor) + "' is not allocated (no backend data)"
+                + ", buffer=" + (tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "null");
+            if (tensor->view_src) {
+                const ggml_tensor * src = tensor->view_src;
+                msg += std::string("; view_src='") + ggml_get_name(src) + "'"
+                    + " data=" + (src->data ? "set" : "null")
+                    + " buffer=" + (src->buffer ? ggml_backend_buffer_name(src->buffer) : "null");
+            }
+            throw std::runtime_error(msg);
+        }
+
         // save the write for later during destruction
         winfos.push_back({tensor, ptr, size, offset});
 

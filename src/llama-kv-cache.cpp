@@ -304,6 +304,30 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    // DIAGNOSTIC: confirm every layer's persistent k_stream/v_stream view (used only by
+    // state_write_data/state_read_data, never by the per-graph get_k()/get_v() views the
+    // normal decode path builds fresh each graph) actually got a data pointer from this
+    // allocation pass, so a broken view is caught at construction time instead of only
+    // surfacing later as a state-save failure.
+    {
+        auto check = [&](const ggml_tensor * t, uint32_t il, const char * what) {
+            if (t && t->data == nullptr) {
+                LLAMA_LOG_WARN("%s: layer %3u: %s has no data right after kv-cache allocation (buffer=%s)\n",
+                        __func__, il, what, t->buffer ? ggml_backend_buffer_name(t->buffer) : "null");
+            }
+        };
+        for (const auto & layer : layers) {
+            check(layer.k, layer.il, "k");
+            check(layer.v, layer.il, "v");
+            for (size_t s = 0; s < layer.k_stream.size(); ++s) {
+                check(layer.k_stream[s], layer.il, "k_stream");
+            }
+            for (size_t s = 0; s < layer.v_stream.size(); ++s) {
+                check(layer.v_stream[s], layer.il, "v_stream");
+            }
+        }
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         n_embd_head_k_all = other->n_embd_head_k_all;
