@@ -2208,27 +2208,26 @@ const slot_info_vec_t *   sinfos_in) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    if (sinfos_out) {
-        sinfos_out->assign(n_stream, slot_info{});
-    }
-
-    if (sinfos_in && sinfos_in->size() != n_stream) {
-        throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
-    }
-
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    if (n_stream_cur != n_stream && seq_id == -1) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-    // a whole-context restore replaces every stream, so the cache is emptied once here
-    // clear() resets all streams at once, so doing it per stream below would keep only the last one
-    if (seq_id == -1) {
-        clear(true);
+    // size against n_stream_cur (the stream count the blob was saved with), not n_stream (this
+    // cache's live stream count): for a per-seq restore the two only agree by chance, and the
+    // loop below indexes sinfos_out/sinfos_in by section index up to n_stream_cur
+    if (sinfos_out) {
+        sinfos_out->assign(n_stream_cur, slot_info{});
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    if (sinfos_in && sinfos_in->size() != n_stream_cur) {
+        throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
+    }
+
+    // the stored layout sets how many stream sections to read; a single seq's
+    // data lands in seq_to_stream[seq_id] regardless of the saved layout
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 

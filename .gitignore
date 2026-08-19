@@ -155,6 +155,8 @@ AGENTS.local.md
 .pi/SYSTEM.md
 .marshall/
 
+.claude/settings.local.json
+
 # Portable release build tree and its packed artifacts (published via GitHub Releases,
 # never committed - the Vulkan shared object alone is ~66 MB).
 /build-release/
