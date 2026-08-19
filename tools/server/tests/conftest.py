@@ -29,6 +29,10 @@ def stop_server_after_each_test():
 def load_server_presets(configure_worker_port, tmp_path_factory):
     # this will be run once per test session, before any tests
 
+    # SKIP_PRESET_LOAD lets a run reuse an already-populated model cache without network access
+    if os.environ.get("SKIP_PRESET_LOAD"):
+        return
+
     # serialize model downloads across parallel workers.
     root_tmp_dir = tmp_path_factory.getbasetemp().parent
     with FileLock(str(root_tmp_dir / "load_all.lock")):
