@@ -153,6 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
 .claude/settings.local.json
 
 # git worktrees (superpowers subagent-driven-development scratch)

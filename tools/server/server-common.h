@@ -189,6 +189,10 @@ public:
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
+    // list of (start_idx, chunk) for all media chunks, in ascending start_idx order.
+    // used to serialize chunk identity/shape (not pixel/audio data) to external storage.
+    std::vector<std::pair<size_t, const mtmd_input_chunk *>> get_media_chunks() const;
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data
