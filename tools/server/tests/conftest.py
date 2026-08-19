@@ -1,3 +1,4 @@
+import os
 import pytest
 from utils import *
 
@@ -18,4 +19,7 @@ def stop_server_after_each_test():
 @pytest.fixture(scope="session", autouse=True)
 def load_server_presets():
     # this will be run once per test session, before any tests
+    # SKIP_PRESET_LOAD lets a run reuse an already-populated model cache without network access
+    if os.environ.get("SKIP_PRESET_LOAD"):
+        return
     ServerPreset.load_all()

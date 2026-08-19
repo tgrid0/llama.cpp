@@ -95,6 +95,7 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
+    swa_full: bool | None = None
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
@@ -109,6 +110,10 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    cache_disk: str | None = None
+    cache_disk_size: int | None = None
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -233,6 +238,8 @@ class ServerProcess:
                 server_args.extend(["--lora", lora_file])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
+        if self.swa_full:
+            server_args.append("--swa-full")
         if self.spec_type:
             server_args.extend(["--spec-type", self.spec_type])
         if self.api_key:
@@ -265,6 +272,14 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.cache_disk is not None:
+            server_args.extend(["--cache-disk", self.cache_disk])
+        if self.cache_disk_size is not None:
+            server_args.extend(["--cache-disk-size", self.cache_disk_size])
+        if self.ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
