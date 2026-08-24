@@ -16,9 +16,9 @@ struct disk_cache_entry {
     int64_t last_used_us = 0;
     std::vector<llama_token> tokens;  // full token sequence; LLAMA_TOKEN_NULL marks a media position
 
-    // number of KV-cache streams (--parallel, unless --kv-unified) the entry was saved
-    // under; a restore into a context with a different n_stream always fails, so this
-    // lets load()/save() detect an incompatible entry without a doomed restore attempt.
+    // number of KV-cache streams (--parallel, unless --kv-unified) the entry was
+    // saved under. Informational only: single-seq restores work across layouts,
+    // so this is not used for compatibility checks.
     // 0 means unknown (pre-n_stream-aware index entry).
     uint32_t n_stream = 0;
 
@@ -50,8 +50,7 @@ public:
     // path: directory path for cache files
     // max_size_mib: max total size in MiB (0 = disabled, >0 = limit, -1 = unlimited)
     // n_stream: number of KV-cache streams this server's context uses (see
-    //           disk_cache_entry::n_stream); entries saved under a different
-    //           n_stream are treated as incompatible and replaced rather than restored
+    //           disk_cache_entry::n_stream); informational only
     // Returns true on success
     bool init(const std::string& path, int32_t max_size_mib, uint32_t n_stream);
 

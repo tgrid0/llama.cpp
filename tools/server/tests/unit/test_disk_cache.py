@@ -92,12 +92,20 @@ def test_disk_cache_hit_after_restart():
         shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+LONG_PROMPT_B = (
+    "In a quiet harbor town, an old lighthouse keeper kept a logbook "
+    "of every ship that passed the cape. Each page recorded the wind, "
+    "the swell, and the names of sailors who asked for water before "
+    "they set sail into the open sea beyond the fog line."
+)
+
+
 def test_disk_cache_survives_parallel_count_change():
-    """A cache entry saved under one --parallel (n_stream) layout must not stay
-    permanently unusable for servers started later with a different --parallel
-    sharing the same --cache-disk dir: the mismatched restore should fall back
-    to a clean reprocess and replace the incompatible entry, so a later fresh
-    server with the new layout gets a real hit instead of reprocessing forever."""
+    """A cache entry saved under one --parallel (n_stream) layout is still
+    usable by a server started with a different --parallel on the same
+    --cache-disk dir, in both directions: the KV state is a single-sequence
+    snapshot, so restore works across layouts (1 -> 4 for prompt A, 4 -> 1
+    for prompt B)."""
     cache_dir = tempfile.mkdtemp(prefix="llama_disk_cache_nstream_")
     try:
         server.n_slots = 1
@@ -111,11 +119,22 @@ def test_disk_cache_survives_parallel_count_change():
             "cache_prompt": True,
         })
         assert res.status_code == 200
-        first_prompt_n = res.body["timings"]["prompt_n"]
-        assert first_prompt_n > 0
+        first_prompt_n_a = res.body["timings"]["prompt_n"]
+        assert first_prompt_n_a > 0
+
+        # stop() hard-kills the process (no shutdown flush), so persist entry A
+        # explicitly: a dissimilar request selects slot 0 via LRU and saves its
+        # state to the disk cache before the slot is reused.
+        server.make_request("POST", "/completion", data={
+            "prompt": "Hello",
+            "cache_prompt": True,
+        })
 
         server.stop()
 
+        # Different --parallel: entry A (saved with n_stream=1) must restore
+        # (1 -> 4). Prompt B is new here; the next request's idle-slot pass
+        # saves it, so blob B has n_stream=4.
         server2 = ServerPreset.tinyllama2()
         server2.n_predict = 4
         server2.temperature = 0.0
@@ -125,39 +144,52 @@ def test_disk_cache_survives_parallel_count_change():
         server2.cache_disk_size = -1
         server2.start()
 
-        # Same prompt, different --parallel: the saved entry is unusable here, so
-        # this must fall back to a full reprocess (not hang, not crash).
-        res2 = server2.make_request("POST", "/completion", data={
+        res2a = server2.make_request("POST", "/completion", data={
             "prompt": LONG_PROMPT,
             "cache_prompt": True,
         })
-        assert res2.status_code == 200
-        assert res2.body["timings"]["prompt_n"] == first_prompt_n, (
-            "mismatched-layout entry should not be usable; expected a full reprocess"
+        assert res2a.status_code == 200
+        assert res2a.body["timings"]["prompt_n"] < first_prompt_n_a, (
+            f"expected disk cache hit across n_stream layouts (1 -> 4): "
+            f"prompt_n={res2a.body['timings']['prompt_n']} should be < {first_prompt_n_a}"
         )
+
+        res2b = server2.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT_B,
+            "cache_prompt": True,
+        })
+        assert res2b.status_code == 200
+        first_prompt_n_b = res2b.body["timings"]["prompt_n"]
+        assert first_prompt_n_b > 0
+
+        # Persist entry B: launching any task saves all idle slots holding
+        # state (cache_idle_slots is on by default).
+        server2.make_request("POST", "/completion", data={
+            "prompt": "Hello",
+            "cache_prompt": True,
+        })
 
         server2.stop()
 
-        # A fresh server with the SAME layout as server2 (no in-memory slot state
-        # to fall back on) must now see a real disk-cache hit: server2's reprocess
-        # should have replaced the incompatible entry rather than leaving it stuck.
+        # Prompt B was saved by the 4-slot server; a 1-slot server must get a
+        # real hit (4 -> 1).
         server3 = ServerPreset.tinyllama2()
         server3.n_predict = 4
         server3.temperature = 0.0
-        server3.n_slots = 4
+        server3.n_slots = 1
         server3.kv_unified = False
         server3.cache_disk = cache_dir
         server3.cache_disk_size = -1
         server3.start()
 
         res3 = server3.make_request("POST", "/completion", data={
-            "prompt": LONG_PROMPT,
+            "prompt": LONG_PROMPT_B,
             "cache_prompt": True,
         })
         assert res3.status_code == 200
-        assert res3.body["timings"]["prompt_n"] < first_prompt_n, (
-            f"expected disk cache hit for a fresh server sharing server2's layout: "
-            f"prompt_n={res3.body['timings']['prompt_n']} should be < {first_prompt_n}"
+        assert res3.body["timings"]["prompt_n"] < first_prompt_n_b, (
+            f"expected disk cache hit across n_stream layouts (4 -> 1): "
+            f"prompt_n={res3.body['timings']['prompt_n']} should be < {first_prompt_n_b}"
         )
 
         server3.stop()

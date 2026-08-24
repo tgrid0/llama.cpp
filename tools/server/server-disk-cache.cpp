@@ -507,14 +507,6 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
         return false;
     }
 
-    if (it->second.n_stream != 0 && it->second.n_stream != m_n_stream) {
-        m_misses++;
-        save_stats();
-        SRV_WRN("disk cache: hash=%.8s... was saved with n_stream=%u, current n_stream=%u, treating as miss\n",
-                hash.c_str(), it->second.n_stream, m_n_stream);
-        return false;
-    }
-
     // Build file path
     std::string filepath = cache_path(m_path, hash + ".bin");
 
@@ -591,29 +583,10 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
     // Check if already in cache
     auto it = m_index.find(hash);
     if (it != m_index.end()) {
-        if (it->second.n_stream == 0 || it->second.n_stream == m_n_stream) {
-            // Already cached under a compatible KV-stream layout, just update timestamp
-            it->second.last_used_us = ggml_time_us();
-            save_index();
-            SRV_INF("disk cache: already cached, hash=%.8s..., refreshed last_used\n", hash.c_str());
-            return true;
-        }
-
-        // Entry was saved under a different --parallel/--kv-unified layout and can
-        // never be restored here: replace it instead of leaving this hash stuck
-        // pointing at a blob this server can never load.
-        SRV_INF("disk cache: hash=%.8s... has incompatible n_stream (entry=%u, current=%u), overwriting\n",
-                hash.c_str(), it->second.n_stream, m_n_stream);
-        fs::remove(cache_path(m_path, hash + ".bin"));
-        if (it->second.ckpt_size_bytes > 0) {
-            fs::remove(cache_path(m_path, hash + ".ckpt"));
-        }
-        if (it->second.media_size_bytes > 0) {
-            fs::remove(cache_path(m_path, hash + ".chunks"));
-        }
-        const uint64_t old_total = it->second.size_bytes + it->second.ckpt_size_bytes + it->second.media_size_bytes;
-        m_total_size = (old_total <= m_total_size) ? (m_total_size - old_total) : 0;
-        m_index.erase(it);
+        it->second.last_used_us = ggml_time_us();
+        save_index();
+        SRV_INF("disk cache: already cached, hash=%.8s..., refreshed last_used\n", hash.c_str());
+        return true;
     }
 
     const server_tokens & src = (full_tokens && !full_tokens->empty()) ? *full_tokens : tokens;
@@ -1204,12 +1177,6 @@ bool server_disk_cache::load_by_hash(const std::string & hash, llama_context * c
 
     auto it = m_index.find(hash);
     if (it == m_index.end()) {
-        return false;
-    }
-
-    if (it->second.n_stream != 0 && it->second.n_stream != m_n_stream) {
-        SRV_WRN("disk cache: hash=%.8s... was saved with n_stream=%u, current n_stream=%u, treating as miss\n",
-                hash.c_str(), it->second.n_stream, m_n_stream);
         return false;
     }
 
