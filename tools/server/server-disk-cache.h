@@ -26,6 +26,13 @@ struct disk_cache_entry {
     // (0 if no checkpoints were saved alongside this entry)
     uint64_t ckpt_size_bytes = 0;
 
+    // size of the "<hash>.dft.bin" sidecar file holding the draft model's serialized
+    // per-sequence KV state (0 if no speculative decoding was active, or the draft
+    // context had no state to save, when this entry was written). A speculative-
+    // decoding server must not restore an entry lacking this: doing so would leave
+    // ctx_dft's position desynced from the freshly-restored ctx_tgt.
+    uint64_t dft_size_bytes = 0;
+
     // start_idx -> serialized mtmd_input_chunk blob (mtmd_input_chunk_save output: identity and
     // shape only, no pixel/audio data). Empty for text-only entries.
     std::map<size_t, std::vector<uint8_t>> media_chunks;
@@ -58,12 +65,16 @@ public:
     // tokens: the token sequence to look up
     // ctx: llama context to restore state into
     // slot_id: slot ID to restore into
+    // ctx_dft: if non-null (speculative decoding is active), the draft context to also
+    //          restore. An entry that was saved without draft state is treated as a miss
+    //          in this case, rather than leaving ctx_dft desynced from the restored ctx.
     // out_hash: if non-null and the load succeeds, receives the matched entry's hash
     //           (so the caller can look up the entry's full token sequence via get_entry())
     // out_checkpoints: if non-null and the load succeeds, receives the entry's saved
     //                  context checkpoints (cleared first; empty if none were saved)
     // Returns true if cache hit and state was loaded successfully
     bool load(const server_tokens& tokens, llama_context* ctx, int32_t slot_id,
+              llama_context* ctx_dft = nullptr,
               std::string * out_hash = nullptr,
               std::list<common_prompt_checkpoint> * out_checkpoints = nullptr);
 
@@ -71,6 +82,10 @@ public:
     // tokens: the token sequence to use as the cache key (hashed)
     // ctx: llama context containing the KV state to save
     // slot_id: slot ID (used for state extraction)
+    // ctx_dft: if non-null (speculative decoding is active), the draft context's
+    //          per-sequence KV state is saved alongside the target's, so a later
+    //          load()/load_by_hash() can restore both in sync. Skipped (non-fatal)
+    //          if the draft context has no state for this sequence yet.
     // full_tokens: the full token sequence corresponding to the saved KV state's
     //               position range (prompt + any generated continuation). If null
     //               or empty, defaults to `tokens`. Stored as entry.tokens so that
@@ -81,6 +96,7 @@ public:
     //              load()/load_by_hash() of this entry.
     // Returns true if saved successfully
     bool save(const server_tokens& tokens, llama_context* ctx, int32_t slot_id,
+              llama_context* ctx_dft = nullptr,
               const server_tokens* full_tokens = nullptr,
               const std::list<common_prompt_checkpoint> * checkpoints = nullptr);
 
@@ -114,14 +130,21 @@ public:
 
     // Find the entry whose tokens form the longest common prefix with `tokens`.
     // Only considers entries with token sequence length >= min_prefix_len.
+    // require_dft: if true, only consider entries that also carry draft-model KV
+    //              state (see disk_cache_entry::dft_size_bytes) - pass true when
+    //              speculative decoding is active, so the caller never picks an
+    //              entry that would leave ctx_dft desynced after restore.
     // Returns the hash of the best match, or "" if none qualifies.
-    std::string find_best_prefix(const server_tokens & tokens, size_t min_prefix_len) const;
+    std::string find_best_prefix(const server_tokens & tokens, size_t min_prefix_len, bool require_dft = false) const;
 
     // Load KV state by hash directly (skips re-hashing the token sequence).
     // Updates last_used_us on the entry. Returns true on success.
+    // ctx_dft: if non-null (speculative decoding is active), the draft context to also
+    //          restore. An entry saved without draft state is treated as a miss.
     // out_checkpoints: if non-null, receives the entry's saved context checkpoints
     //                  (cleared first; empty if none were saved).
     bool load_by_hash(const std::string & hash, llama_context * ctx, int32_t slot_id,
+                       llama_context * ctx_dft = nullptr,
                        std::list<common_prompt_checkpoint> * out_checkpoints = nullptr);
 
     // Read-only access to an index entry. Returns nullptr if hash not found.

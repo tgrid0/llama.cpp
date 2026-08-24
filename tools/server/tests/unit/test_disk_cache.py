@@ -290,6 +290,111 @@ def test_disk_cache_prefix_search():
         shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+SPEC_DRAFT_MODEL_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+
+
+SHORT_UNRELATED_PROMPT = "Meanwhile, across the ocean, a merchant counted his coins."
+
+
+def _spec_server(cache_dir):
+    # Self-speculation (draft model == target model): the disk-cache index only
+    # needs a real ctx_dft to exercise, and this sidesteps needing a second,
+    # vocab-compatible offline-cached model just for the draft role.
+    model_path = download_file(SPEC_DRAFT_MODEL_URL)
+    s = ServerProcess()
+    s.model_file = model_path
+    s.model_alias = "stories15m-q4_0"
+    s.n_ctx = 1024
+    s.n_batch = 256
+    s.n_slots = 1
+    s.n_predict = 8
+    s.temperature = 0.0
+    s.seed = 42
+    s.model_draft = model_path
+    s.spec_type = "draft-simple"
+    s.spec_draft_n_min = 1
+    s.spec_draft_n_max = 4
+    s.fa = "off"
+    s.cache_disk = cache_dir
+    s.cache_disk_size = -1
+    return s
+
+
+def test_disk_cache_hit_with_speculative_decoding():
+    """Regression: a disk-cache restore must bring the draft model's KV cache back
+    in sync with the target's. Before the fix, only ctx_tgt was saved/restored, so
+    after a restore ctx_dft was left at whatever position it last held, desynced
+    from the newly-restored ctx_tgt. llama-batch.cpp only rejects a mismatch when
+    the sequence already has *some* stored position (seq_pos_max >= 0) - an empty
+    sequence is always accepted as a fresh start - so reproducing the crash needs
+    ctx_dft to hold real, nonzero, stale state, not just be cleared to empty.
+
+    With a single slot, an unrelated prompt reusing that slot forces the target
+    and draft contexts to reprocess from scratch and settle at a small, real
+    position. Requesting the original long prompt again then hits the entry saved
+    by request A: ctx_tgt gets restored straight to its high saved position, while
+    (pre-fix) ctx_dft is left at the short unrelated prompt's small position - a
+    real, nonzero mismatch, which is exactly what triggered the production bug's
+    "inconsistent sequence positions" / failed-decode loop.
+    """
+    cache_dir = tempfile.mkdtemp(prefix="llama_disk_cache_spec_")
+    fd, log_path = tempfile.mkstemp(suffix=".log", dir=cache_dir)
+    os.close(fd)
+    try:
+        server_spec = _spec_server(cache_dir)
+        server_spec.debug = True
+        server_spec.log_path = log_path
+        server_spec.start()
+
+        # Request A: fills the only slot, generating with the draft model's help.
+        # Evicted (and thus saved to disk) by request B below.
+        res = server_spec.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert res.body["timings"]["draft_n"] > 0
+
+        # Request B: unrelated short prompt reuses the same (only) slot, forcing
+        # ctx_tgt and ctx_dft to reprocess from scratch and settle at a small,
+        # real, nonzero position - the "stale state" ingredient the crash needs.
+        res_b = server_spec.make_request("POST", "/completion", data={
+            "prompt": SHORT_UNRELATED_PROMPT,
+            "cache_prompt": True,
+        })
+        assert res_b.status_code == 200
+
+        # Request C: the original long prompt again -> exact-hash disk cache hit,
+        # restoring ctx_tgt to a position far beyond ctx_dft's stale one (still
+        # sitting at request B's short prompt length). Generation must continue
+        # normally, not desync and fail to decode.
+        res_c = server_spec.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT,
+            "cache_prompt": True,
+        })
+        assert res_c.status_code == 200
+        assert len(res_c.body["content"]) > 0
+        assert res_c.body["timings"]["cache_n"] > 0, (
+            "expected request C to reuse cached tokens (a disk-cache restore), "
+            f"got timings: {res_c.body['timings']}"
+        )
+
+        # Stop the server so its log is fully flushed before the final check
+        # (the requests above only prove no crash happened; reading the full log
+        # after a clean stop reliably confirms the restore path taken, without
+        # racing the server's own log-flush timing).
+        server_spec.stop()
+        with open(log_path) as f:
+            logs = f.read()
+        assert "disk cache: exact hit" in logs, f"expected an exact disk-cache hit, got:\n{logs}"
+        assert "inconsistent sequence positions" not in logs, (
+            f"draft context desynced from target after disk-cache restore:\n{logs}"
+        )
+        assert "failed to decode" not in logs, f"decode failed after disk-cache restore:\n{logs}"
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 def test_disk_cache_hit_after_clean_shutdown():
     """Active slot KV state is flushed to disk on shutdown; restarted server loads it."""
     cache_dir = tempfile.mkdtemp(prefix="llama_disk_cache_shutdown_")

@@ -900,7 +900,7 @@ private:
         // any generated continuation) as entry.tokens. The saved KV state's pos_max
         // corresponds to the full sequence, so restoring this entry must yield
         // prompt.tokens of that same length to keep n_past/pos_min bookkeeping consistent.
-        return disk_cache->save(prompt_tokens, ctx_tgt, slot.id, &slot.prompt.tokens, &slot.prompt.checkpoints);
+        return disk_cache->save(prompt_tokens, ctx_tgt, slot.id, ctx_dft, &slot.prompt.tokens, &slot.prompt.checkpoints);
     }
 
     void flush_disk_cache() {
@@ -1709,7 +1709,7 @@ private:
                 if (disk_cache) {
                     std::string exact_hash;
                     std::list<common_prompt_checkpoint> loaded_checkpoints;
-                    loaded = disk_cache->load(task.tokens, ctx_tgt, ret->id, &exact_hash, &loaded_checkpoints);
+                    loaded = disk_cache->load(task.tokens, ctx_tgt, ret->id, ctx_dft, &exact_hash, &loaded_checkpoints);
                     if (loaded) {
                         // Disk cache restores KV state but does not set prompt.tokens.
                         // We must set it here so that update_slots() can compute n_past correctly.
@@ -1729,9 +1729,9 @@ private:
                     if (!loaded) {
                         const size_t n_req = task.tokens.size();
                         const size_t min_prefix_len = std::max((size_t)1, n_req / 2);
-                        const std::string prefix_hash = disk_cache->find_best_prefix(task.tokens, min_prefix_len);
+                        const std::string prefix_hash = disk_cache->find_best_prefix(task.tokens, min_prefix_len, ctx_dft != nullptr);
                         if (!prefix_hash.empty()) {
-                            loaded = disk_cache->load_by_hash(prefix_hash, ctx_tgt, ret->id, &loaded_checkpoints);
+                            loaded = disk_cache->load_by_hash(prefix_hash, ctx_tgt, ret->id, ctx_dft, &loaded_checkpoints);
                             if (loaded) {
                                 ret->prompt.tokens = disk_cache->rebuild_tokens(prefix_hash, ret->mctx != nullptr);
                                 ret->prompt.checkpoints = std::move(loaded_checkpoints);

@@ -487,6 +487,7 @@ bool server_disk_cache::read_media_chunks_file(const std::string & filepath, std
 }
 
 bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, int32_t slot_id,
+                              llama_context* ctx_dft,
                               std::string * out_hash,
                               std::list<common_prompt_checkpoint> * out_checkpoints) {
     if (!m_enabled || tokens.empty() || !ctx) {
@@ -503,6 +504,17 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
         m_misses++;
         save_stats();
         SRV_INF("disk cache: exact miss for %zu tokens, hash=%.8s... (hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
+                tokens.size(), hash.c_str(), m_hits, m_misses);
+        return false;
+    }
+
+    // A speculative-decoding server can only use entries that also carry draft-model
+    // KV state; otherwise ctx_dft would be left desynced from the freshly-restored
+    // ctx position, corrupting the next draft decode. Treat this like a miss.
+    if (ctx_dft && it->second.dft_size_bytes == 0) {
+        m_misses++;
+        save_stats();
+        SRV_INF("disk cache: exact match for %zu tokens has no draft-model state, treating as miss, hash=%.8s... (hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
                 tokens.size(), hash.c_str(), m_hits, m_misses);
         return false;
     }
@@ -540,6 +552,29 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
         return false;
     }
 
+    if (ctx_dft) {
+        std::string dft_filepath = cache_path(m_path, hash + ".dft.bin");
+        std::ifstream dft_file(dft_filepath, std::ios::binary | std::ios::ate);
+        if (!dft_file.is_open()) {
+            SRV_WRN("disk cache: failed to open draft cache file '%s'\n", dft_filepath.c_str());
+            return false;
+        }
+        size_t dft_file_size = (size_t) dft_file.tellg();
+        dft_file.seekg(0, std::ios::beg);
+        std::vector<uint8_t> dft_data(dft_file_size);
+        if (dft_file_size > 0 && !dft_file.read(reinterpret_cast<char*>(dft_data.data()), dft_file_size)) {
+            SRV_WRN("disk cache: failed to read draft cache file '%s'\n", dft_filepath.c_str());
+            return false;
+        }
+        dft_file.close();
+
+        size_t dft_restored = llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), slot_id, 0);
+        if (dft_restored != dft_data.size()) {
+            SRV_WRN("disk cache: partial draft restore: expected %zu, got %zu\n", dft_data.size(), dft_restored);
+            return false;
+        }
+    }
+
     // Update index: update last_used timestamp
     it = m_index.find(hash);
     if (it != m_index.end()) {
@@ -569,6 +604,7 @@ bool server_disk_cache::load(const server_tokens& tokens, llama_context* ctx, in
 }
 
 bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, int32_t slot_id,
+                              llama_context* ctx_dft,
                               const server_tokens* full_tokens,
                               const std::list<common_prompt_checkpoint> * checkpoints) {
     if (!m_enabled || tokens.empty() || !ctx) {
@@ -684,7 +720,10 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
             if (old_entry.media_size_bytes > 0) {
                 fs::remove(cache_path(m_path, it2->first + ".chunks"));
             }
-            const uint64_t old_total = old_entry.size_bytes + old_entry.ckpt_size_bytes + old_entry.media_size_bytes;
+            if (old_entry.dft_size_bytes > 0) {
+                fs::remove(cache_path(m_path, it2->first + ".dft.bin"));
+            }
+            const uint64_t old_total = old_entry.size_bytes + old_entry.ckpt_size_bytes + old_entry.media_size_bytes + old_entry.dft_size_bytes;
             m_total_size = (old_total <= m_total_size) ? (m_total_size - old_total) : 0;
             it2 = m_index.erase(it2);
             n_pruned++;
@@ -742,6 +781,51 @@ bool server_disk_cache::save(const server_tokens& tokens, llama_context* ctx, in
             fs::remove(filepath);
             fs::remove(chunks_filepath);
             return false;
+        }
+    }
+
+    // Persist the draft model's KV state alongside the target's, if speculative
+    // decoding is active. Skipped (non-fatal) if the draft context has no state
+    // for this sequence yet - the entry is simply treated as tgt-only later
+    // (see load()/load_by_hash()/find_best_prefix()'s require_dft handling).
+    if (ctx_dft) {
+        size_t dft_state_size = llama_state_seq_get_size_ext(ctx_dft, slot_id, 0);
+        if (dft_state_size > 0) {
+            std::vector<uint8_t> dft_data(dft_state_size);
+            size_t dft_obtained = llama_state_seq_get_data_ext(ctx_dft, dft_data.data(), dft_state_size, slot_id, 0);
+            if (dft_obtained != dft_state_size) {
+                SRV_WRN("disk cache: failed to get draft KV state: expected %zu, got %zu\n", dft_state_size, dft_obtained);
+            } else {
+                const std::string dft_filepath     = cache_path(m_path, hash + ".dft.bin");
+                const std::string dft_tmp_filepath = dft_filepath + ".tmp";
+
+                bool dft_ok = false;
+                std::ofstream dft_file(dft_tmp_filepath, std::ios::binary);
+                if (dft_file.is_open()) {
+                    dft_file.write(reinterpret_cast<const char*>(dft_data.data()), dft_obtained);
+                    dft_file.flush();
+                    if (!dft_file.fail()) {
+                        dft_file.close();
+                        std::error_code dft_ec;
+                        fs::rename(dft_tmp_filepath, dft_filepath, dft_ec);
+                        if (!dft_ec) {
+                            entry.dft_size_bytes = dft_obtained;
+                            m_total_size += dft_obtained;
+                            dft_ok = true;
+                        } else {
+                            SRV_WRN("disk cache: failed to rename draft cache file: %s\n", dft_ec.message().c_str());
+                        }
+                    } else {
+                        SRV_WRN("disk cache: failed to write draft cache file '%s'\n", dft_tmp_filepath.c_str());
+                        dft_file.close();
+                    }
+                } else {
+                    SRV_WRN("disk cache: failed to create draft cache file '%s'\n", dft_tmp_filepath.c_str());
+                }
+                if (!dft_ok) {
+                    fs::remove(dft_tmp_filepath);
+                }
+            }
         }
     }
 
@@ -803,9 +887,12 @@ bool server_disk_cache::evict_oldest() {
     if (oldest_it->second.media_size_bytes > 0) {
         fs::remove(cache_path(m_path, oldest_it->first + ".chunks"));
     }
+    if (oldest_it->second.dft_size_bytes > 0) {
+        fs::remove(cache_path(m_path, oldest_it->first + ".dft.bin"));
+    }
 
     // Update index
-    const uint64_t entry_total = oldest_it->second.size_bytes + oldest_it->second.ckpt_size_bytes + oldest_it->second.media_size_bytes;
+    const uint64_t entry_total = oldest_it->second.size_bytes + oldest_it->second.ckpt_size_bytes + oldest_it->second.media_size_bytes + oldest_it->second.dft_size_bytes;
     if (entry_total <= m_total_size) {
         m_total_size -= entry_total;
     } else {
@@ -898,6 +985,9 @@ void server_disk_cache::validate_and_rebuild() {
             if (it->second.media_size_bytes > 0) {
                 fs::remove(cache_path(m_path, it->first + ".chunks"));
             }
+            if (it->second.dft_size_bytes > 0) {
+                fs::remove(cache_path(m_path, it->first + ".dft.bin"));
+            }
             it = m_index.erase(it);
             removed++;
         } else {
@@ -911,6 +1001,9 @@ void server_disk_cache::validate_and_rebuild() {
                 it->second.media_size_bytes = 0;
                 it->second.media_chunks.clear();
             }
+            if (it->second.dft_size_bytes > 0 && !fs::exists(cache_path(m_path, it->first + ".dft.bin"))) {
+                it->second.dft_size_bytes = 0;
+            }
             ++it;
         }
     }
@@ -918,7 +1011,7 @@ void server_disk_cache::validate_and_rebuild() {
     // Rebuild total size
     m_total_size = 0;
     for (const auto& [hash, entry] : m_index) {
-        m_total_size += entry.size_bytes + entry.ckpt_size_bytes + entry.media_size_bytes;
+        m_total_size += entry.size_bytes + entry.ckpt_size_bytes + entry.media_size_bytes + entry.dft_size_bytes;
     }
 
     if (removed > 0) {
@@ -1030,6 +1123,7 @@ bool server_disk_cache::load_index() {
             entry.last_used_us    = entry_json.value("last_used_us",    (int64_t)0);
             entry.ckpt_size_bytes = entry_json.value("ckpt_size_bytes", (uint64_t)0);
             entry.media_size_bytes = entry_json.value("media_size_bytes", (uint64_t)0);
+            entry.dft_size_bytes  = entry_json.value("dft_size_bytes",  (uint64_t)0);
             entry.n_stream        = entry_json.value("n_stream",        (uint32_t)0);
             // read tokens array if present (absent in old-format entries)
             if (entry_json.contains("tokens") && entry_json["tokens"].is_array()) {
@@ -1048,7 +1142,7 @@ bool server_disk_cache::load_index() {
                 }
             }
             m_index[hash] = entry;
-            m_total_size += entry.size_bytes + entry.ckpt_size_bytes + entry.media_size_bytes;
+            m_total_size += entry.size_bytes + entry.ckpt_size_bytes + entry.media_size_bytes + entry.dft_size_bytes;
         }
     }
 
@@ -1118,7 +1212,7 @@ server_tokens server_disk_cache::rebuild_tokens(const std::string & hash, bool h
     return st;
 }
 
-std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, size_t min_prefix_len) const {
+std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, size_t min_prefix_len, bool require_dft) const {
     if (!m_enabled || tokens.empty()) {
         return "";
     }
@@ -1134,6 +1228,10 @@ std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, si
     for (const auto & [hash, entry] : m_index) {
         if (entry.tokens.empty()) {
             continue;  // old-format entry without token data
+        }
+
+        if (require_dft && entry.dft_size_bytes == 0) {
+            continue;  // would leave ctx_dft desynced from the restored ctx_tgt
         }
 
         const server_tokens entry_tokens = rebuild_tokens_impl(entry);
@@ -1170,6 +1268,7 @@ std::string server_disk_cache::find_best_prefix(const server_tokens & tokens, si
 }
 
 bool server_disk_cache::load_by_hash(const std::string & hash, llama_context * ctx, int32_t slot_id,
+                                      llama_context * ctx_dft,
                                       std::list<common_prompt_checkpoint> * out_checkpoints) {
     if (!m_enabled || hash.empty() || !ctx) {
         return false;
@@ -1177,6 +1276,12 @@ bool server_disk_cache::load_by_hash(const std::string & hash, llama_context * c
 
     auto it = m_index.find(hash);
     if (it == m_index.end()) {
+        return false;
+    }
+
+    // See load(): an entry without draft-model state must not be used to restore
+    // a speculative-decoding server's ctx, or ctx_dft would end up desynced.
+    if (ctx_dft && it->second.dft_size_bytes == 0) {
         return false;
     }
 
@@ -1208,6 +1313,29 @@ bool server_disk_cache::load_by_hash(const std::string & hash, llama_context * c
     if (restored != data.size()) {
         SRV_WRN("disk cache: partial restore: expected %zu, got %zu\n", data.size(), restored);
         return false;
+    }
+
+    if (ctx_dft) {
+        std::string dft_filepath = cache_path(m_path, hash + ".dft.bin");
+        std::ifstream dft_file(dft_filepath, std::ios::binary | std::ios::ate);
+        if (!dft_file.is_open()) {
+            SRV_WRN("disk cache: failed to open draft cache file '%s'\n", dft_filepath.c_str());
+            return false;
+        }
+        size_t dft_file_size = (size_t) dft_file.tellg();
+        dft_file.seekg(0, std::ios::beg);
+        std::vector<uint8_t> dft_data(dft_file_size);
+        if (dft_file_size > 0 && !dft_file.read(reinterpret_cast<char*>(dft_data.data()), dft_file_size)) {
+            SRV_WRN("disk cache: failed to read draft cache file '%s'\n", dft_filepath.c_str());
+            return false;
+        }
+        dft_file.close();
+
+        size_t dft_restored = llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), slot_id, 0);
+        if (dft_restored != dft_data.size()) {
+            SRV_WRN("disk cache: partial draft restore: expected %zu, got %zu\n", dft_data.size(), dft_restored);
+            return false;
+        }
     }
 
     it = m_index.find(hash);
@@ -1249,6 +1377,7 @@ bool server_disk_cache::save_index() {
         entry_json["last_used_us"]    = entry.last_used_us;
         entry_json["ckpt_size_bytes"] = entry.ckpt_size_bytes;
         entry_json["media_size_bytes"] = entry.media_size_bytes;
+        entry_json["dft_size_bytes"]  = entry.dft_size_bytes;
         entry_json["n_stream"]        = entry.n_stream;
         // write tokens as flat int32 array
         nlohmann::json toks = nlohmann::json::array();
