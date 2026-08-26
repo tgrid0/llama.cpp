@@ -27,7 +27,7 @@ static std::string cache_path(const std::string& dir, const std::string& filenam
 
 #define U8V(v) ((uint8_t)(v) & 0xFFU)
 #define U32V(v) ((uint32_t)(v) & 0xFFFFFFFFU)
-#define ROTL32(v, n) U32V((uint32_t)(v) << (n)) | ((uint32_t)(v) >> (32 - (n)))
+#define ROTL32(v, n) (((uint32_t)(v) << (n)) | ((uint32_t)(v) >> (32 - (n))))
 #define ROTR32(v, n) ROTL32(v, 32 - (n))
 
 typedef struct {
@@ -67,7 +67,7 @@ static const uint32_t K[64] = {
     0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
     0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
     0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106a0070,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
     0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
@@ -76,24 +76,21 @@ static const uint32_t K[64] = {
 
 static void embed_sha256_transform(uint32_t *state, const uint32_t *data) {
     uint32_t W[64];
-    uint32_t a,b,c,d,e,f,g,h;
+    uint32_t a, b, c, d, e, f, g, h, T1, T2;
     unsigned j;
-    a = state[0]; b = state[1]; c = state[2]; d = state[3];
-    e = state[4]; f = state[5]; g = state[6]; h = state[7];
 
     for (j = 0; j < 16; j++) W[j] = data[j];
     for (j = 16; j < 64; j++) W[j] = s1(W[j-2]) + W[j-7] + s0(W[j-15]) + W[j-16];
 
-    #define R(i) h+=S1(e)+Ch(e,f,g)+K[i]+W[i]; d+=h; h+=S0(a)+Maj(a,b,c)
-    R(0); R(1); R(2); R(3); R(4); R(5); R(6); R(7);
-    R(8); R(9); R(10); R(11); R(12); R(13); R(14); R(15);
-    R(16); R(17); R(18); R(19); R(20); R(21); R(22); R(23);
-    R(24); R(25); R(26); R(27); R(28); R(29); R(30); R(31);
-    R(32); R(33); R(34); R(35); R(36); R(37); R(38); R(39);
-    R(40); R(41); R(42); R(43); R(44); R(45); R(46); R(47);
-    R(48); R(49); R(50); R(51); R(52); R(53); R(54); R(55);
-    R(56); R(57); R(58); R(59); R(60); R(61); R(62); R(63);
-    #undef R
+    a = state[0]; b = state[1]; c = state[2]; d = state[3];
+    e = state[4]; f = state[5]; g = state[6]; h = state[7];
+
+    for (j = 0; j < 64; j++) {
+        T1 = h + S1(e) + Ch(e, f, g) + K[j] + W[j];
+        T2 = S0(a) + Maj(a, b, c);
+        h = g; g = f; f = e; e = d + T1;
+        d = c; c = b; b = a; a = T1 + T2;
+    }
 
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
