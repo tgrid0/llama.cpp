@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -125,9 +126,60 @@ static void test_q8() {
     std::remove(path.c_str());
 }
 
+// the ctor rejects bad arguments with an exception
+template <typename F>
+static void expect_throws(F f) {
+    bool threw = false;
+    try {
+        f();
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+// file truncated after open: rows past the new end make gather() fail
+static void test_truncated() {
+    const std::string path = "ple-test-trunc.bin";
+    const int64_t head_dim = 4, n_rows = 8;
+    write_f16_rows(path, n_rows, head_dim);
+
+    {
+        llama_ple_stream s(path.c_str(), 0, n_rows, head_dim, GGML_TYPE_F16, 0, false);
+        const std::vector<int32_t> idx = {0};
+        std::vector<float> dst(head_dim);
+        assert(s.gather(idx.data(), idx.size(), dst.data()));
+        check_dst(dst, idx, head_dim);
+
+        // shrink to 1 row after open: row 5 is past the new end
+        write_f16_rows(path, 1, head_dim);
+        const std::vector<int32_t> idx2 = {5};
+        std::vector<float> dst2(head_dim);
+        assert(!s.gather(idx2.data(), idx2.size(), dst2.data()));
+    }
+    std::remove(path.c_str());
+}
+
+static void test_ctor_errors() {
+    const std::string path = "ple-test-ctor.bin";
+    const int64_t head_dim = 4, n_rows = 8;
+    write_f16_rows(path, n_rows, head_dim);
+
+    expect_throws([&] { llama_ple_stream s("", 0, n_rows, head_dim, GGML_TYPE_F16, 0, false); });
+    expect_throws([&] { llama_ple_stream s("ple-test-missing.bin", 0, n_rows, head_dim, GGML_TYPE_F16, 0, false); });
+    expect_throws([&] { llama_ple_stream s(path.c_str(), 0, 0, head_dim, GGML_TYPE_F16, 0, false); });
+    expect_throws([&] { llama_ple_stream s(path.c_str(), 0, n_rows, -1, GGML_TYPE_F16, 0, false); });
+    // data out of file bounds
+    expect_throws([&] { llama_ple_stream s(path.c_str(), 0, n_rows * 100, head_dim, GGML_TYPE_F16, 0, false); });
+
+    std::remove(path.c_str());
+}
+
 int main() {
     test_f16();
     test_q8();
+    test_truncated();
+    test_ctor_errors();
     printf("test-ple-stream: all tests passed\n");
     return 0;
 }

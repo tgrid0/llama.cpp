@@ -64,7 +64,15 @@ static const uint8_t * ple_pread(llama_file & file, uint8_t * staging, size_t le
             r = pread(fd, staging, total, aoffs);
         } while (r < 0 && errno == EINTR);
         if (r < 0 || (size_t) r < head + len) {
-            return nullptr;
+            // mid-stream direct I/O failure: fall back to buffered I/O for this read,
+            // as llama_file does
+            try {
+                file.seek(offs, SEEK_SET);
+                file.read_raw(staging, len);
+                return staging;
+            } catch (...) {
+                return nullptr;
+            }
         }
         return staging + head;
     }
@@ -152,6 +160,11 @@ llama_ple_stream::~llama_ple_stream() {
 // read row into the cache slot (slot >= 0) or into row_buf_ (slot < 0); sets src
 // to the row bytes
 bool llama_ple_stream::read_row(int32_t row, int64_t slot, const uint8_t * & src) {
+    // a direct read failure may have switched the file to buffered I/O
+    if (use_direct_io_ && !file_->has_direct_io()) {
+        use_direct_io_ = false;
+    }
+
     const size_t offs = offs_ + (size_t) row * row_size_;
 
     uint8_t * dst_buf = row_buf_;

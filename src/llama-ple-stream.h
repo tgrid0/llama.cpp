@@ -54,7 +54,11 @@ public:
         int64_t n_file_reads   = 0;
         int64_t n_file_bytes   = 0;
     };
-    const stats & get_stats() const { return stats_; }
+    // returns a copy; gather() updates stats_ under mtx_
+    stats get_stats() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return stats_;
+    }
 
 private:
     bool read_row(int32_t row, int64_t slot, const uint8_t * & src);
@@ -78,6 +82,6 @@ private:
     // scratch: (row, position) pairs, kept in idx order; consecutive equal rows grouped
     std::vector<std::pair<int32_t, size_t>> pairs_;
 
-    std::mutex mtx_;
+    mutable std::mutex mtx_; // get_stats() is const
     stats stats_;
 };
