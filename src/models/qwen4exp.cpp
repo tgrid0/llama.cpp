@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-stream.h"
 
 #include <algorithm>
 
@@ -136,10 +137,29 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
         const int64_t ple_rows = ple_w->tensor->ne[1];
-        // the PLE/engram table is gathered 16 random rows per token and never read densely, so
-        // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+
+        if (params.ple_stream) {
+            // stream the table from the GGUF on demand: register the skip so the
+            // loader accounting stays consistent; no buffer is allocated, no data
+            // is loaded. the buft lists are unused for a TENSOR_STREAMED skip.
+            ml.create_tensor(hparams, nullptr, nullptr, nullptr, nullptr,
+                    tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                    { hparams.ple_head_dim, ple_rows }, TENSOR_STREAMED);
+
+            ple_stream = std::make_unique<llama_ple_stream>(
+                    ml.file_paths[ple_w->idx].c_str(), ple_w->offs, ple_rows,
+                    hparams.ple_head_dim, ple_w->tensor->type,
+                    params.ple_cache_rows, params.ple_direct_io);
+
+            // per_layer_tok_embd stays nullptr: build_ple gathers through
+            // ple_stream, which forces the host-gather path
+        } else {
+            // the PLE/engram table is gathered 16 random rows per token and never
+            // read densely, so it wants MADV_RANDOM and no eager pull-in. See
+            // --tensor-read-lazy.
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        }
     }
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
@@ -225,6 +245,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 }
+
+// out-of-line: the unique_ptr member needs the complete llama_ple_stream type
+llama_model_qwen4exp::llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+
+llama_model_qwen4exp::~llama_model_qwen4exp() = default;
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
@@ -1124,7 +1149,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // the table is far too big to offload, so it is gathered straight out of the mapping: one
     // fault per row, 16 per token, no two of them on the same page. left to the get_rows those
     // faults happen one at a time; queued here they are in flight before the graph even runs.
-    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size()); // no-op with ple_stream (per_layer_tok_embd == nullptr)
 
     if (rows) {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -1133,22 +1158,33 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     // Gather host-side. Head varies fastest within a token, the layout ggml_get_rows produced for
     // the same index vector, so the flattened [head_dim * n_heads] row per token is unchanged.
-    const ggml_tensor * tbl      = pmodel.per_layer_tok_embd;
-    const int64_t       head_dim = tbl->ne[0];
-    const size_t        row_sz   = ggml_row_size(tbl->type, head_dim);
-    const char *        base     = (const char *) tbl->data;
+    const int64_t head_dim = pmodel.ple_stream != nullptr
+        ? (int64_t) pmodel.hparams.ple_head_dim
+        : pmodel.per_layer_tok_embd->ne[0];
 
     // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical
     std::vector<float> vals((size_t) head_dim * idx.size());
-    if (tbl->type == GGML_TYPE_F32) {
-        for (size_t k = 0; k < idx.size(); ++k) {
-            memcpy(vals.data() + k*head_dim, base + (size_t) idx[k]*row_sz, head_dim*sizeof(float));
+    if (pmodel.ple_stream != nullptr) {
+        // the SSD stream reads the rows on demand and dequantizes them exactly like
+        // the resident gather below
+        if (!pmodel.ple_stream->gather(idx.data(), idx.size(), vals.data())) {
+            throw std::runtime_error("PLE table streaming read failed");
         }
     } else {
-        const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
-        GGML_ASSERT(traits->to_float && "PLE table type has no to_float");
-        for (size_t k = 0; k < idx.size(); ++k) {
-            traits->to_float(base + (size_t) idx[k]*row_sz, vals.data() + k*head_dim, head_dim);
+        const ggml_tensor * tbl      = pmodel.per_layer_tok_embd;
+        const size_t        row_sz   = ggml_row_size(tbl->type, head_dim);
+        const char *        base     = (const char *) tbl->data;
+
+        if (tbl->type == GGML_TYPE_F32) {
+            for (size_t k = 0; k < idx.size(); ++k) {
+                memcpy(vals.data() + k*head_dim, base + (size_t) idx[k]*row_sz, head_dim*sizeof(float));
+            }
+        } else {
+            const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
+            GGML_ASSERT(traits->to_float && "PLE table type has no to_float");
+            for (size_t k = 0; k < idx.size(); ++k) {
+                traits->to_float(base + (size_t) idx[k]*row_sz, vals.data() + k*head_dim, head_dim);
+            }
         }
     }
 
@@ -1210,6 +1246,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         int                  il) {
     GGML_UNUSED(inp);
 
+    const llama_model_qwen4exp & pmodel = static_cast<const llama_model_qwen4exp &>(model);
+
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc * n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
@@ -1220,7 +1258,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
 
     // heads lie slowest within a token either way, as the reference does
     ggml_tensor * emb = nullptr;
-    if (ple_host_gather()) {
+    if (ple_host_gather() || pmodel.ple_stream != nullptr) {
         ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
                 hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb);

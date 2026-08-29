@@ -2306,8 +2306,10 @@ struct llama_model_qwen35 : public llama_model_base {
 };
 
 
+struct llama_ple_stream;
+
 struct llama_model_qwen4exp : public llama_model_base {
-    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    llama_model_qwen4exp(const struct llama_model_params & params);
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2319,6 +2321,12 @@ struct llama_model_qwen4exp : public llama_model_base {
         }
         return { per_layer_tok_embd };
     }
+
+    // SSD streaming of the PLE n-gram table; null unless --ple-stream.
+    // per_layer_tok_embd stays null then: the graph gathers through this stream.
+    std::unique_ptr<llama_ple_stream> ple_stream;
+
+    ~llama_model_qwen4exp() override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
