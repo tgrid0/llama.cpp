@@ -75,8 +75,7 @@ private:
     // aligned staging for O_DIRECT reads and cache=0 reads (row_size_ + 2*align)
     uint8_t * row_buf_ = nullptr;
 
-    // scratch: (row, position) pairs, sorted by row so equal rows are grouped and
-    // reads go in file order
+    // scratch: (row, position) pairs, kept in idx order; consecutive equal rows grouped
     std::vector<std::pair<int32_t, size_t>> pairs_;
 
     std::mutex mtx_;

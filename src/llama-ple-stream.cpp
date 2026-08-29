@@ -2,7 +2,6 @@
 
 #include "llama-impl.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>

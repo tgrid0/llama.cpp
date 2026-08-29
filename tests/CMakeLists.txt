@@ -280,7 +280,10 @@ llama_build_and_test(test-backend-ops.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
-llama_build_and_test(test-ple-stream.cpp)
+# internal (non-LLAMA_API) class, not exported on Windows shared builds
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-ple-stream.cpp)
+endif()
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
