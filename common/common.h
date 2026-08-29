@@ -580,6 +580,10 @@ struct common_params {
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
 
+    uint32_t ple_cache_rows      = 1 << 20; // PLE n-gram row cache slots (0 = disabled)
+    bool     ple_direct_io       = false;   // use O_DIRECT for PLE table reads (bypass page cache)
+    bool     ple_stream          = false;   // stream the PLE n-gram table from disk on demand
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

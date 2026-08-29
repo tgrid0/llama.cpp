@@ -105,6 +105,21 @@ static void test(void) {
         }
     }
 
+    {
+        // the PLE streaming flags must be registered (server example)
+        auto ctx_arg = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER);
+        common_params_add_preset_options(ctx_arg.options);
+        std::unordered_set<std::string> args;
+        for (const auto & opt : ctx_arg.options) {
+            for (const auto & arg : opt.get_args()) {
+                args.insert(arg);
+            }
+        }
+        assert(args.count("--ple-stream") == 1);
+        assert(args.count("--ple-cache-rows") == 1);
+        assert(args.count("--ple-direct-io") == 1);
+    }
+
     auto list_str_to_char = [](std::vector<std::string> & argv) -> std::vector<char *> {
         std::vector<char *> res;
         for (auto & arg : argv) {

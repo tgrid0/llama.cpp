@@ -355,6 +355,12 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool moe_stream;      // stream MoE routed expert weights from disk on demand
+
+        // SSD streaming of the PLE n-gram table (qwen4exp): the table is not loaded;
+        // rows are read from the GGUF on demand into a bounded host row cache
+        uint32_t ple_cache_rows;  // row cache slots (0 = disabled)
+        bool     ple_direct_io;   // use O_DIRECT for PLE reads (bypass page cache); falls back if unsupported
+        bool     ple_stream;      // stream the PLE n-gram table from disk on demand
     };
 
     struct llama_sampler_seq_config {

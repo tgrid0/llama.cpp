@@ -2810,6 +2810,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_direct = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    add_opt(common_arg(
+        {"--ple-stream"},
+        "stream the PLE n-gram table from the GGUF on demand instead of loading it (qwen4exp); "
+        "keeps the table out of RAM (use with --load-mode none or dio); bypasses the mmap lazy-read path",
+        [](common_params & params) {
+            params.ple_stream = true;
+        }
+    ).set_env("LLAMA_ARG_PLE_STREAM"));
+    add_opt(common_arg(
+        {"--ple-cache-rows"}, "N",
+        "PLE row cache slots for --ple-stream (0 = disabled, default: 1M rows); each slot is one "
+        "quantized table row; implies --ple-stream",
+        [](common_params & params, const std::string & value) {
+            params.ple_stream = true;
+            const uint64_t n = std::stoul(value);
+            if (n > UINT32_MAX) {
+                throw std::invalid_argument("PLE cache rows out of range");
+            }
+            params.ple_cache_rows = (uint32_t) n;
+        }
+    ).set_env("LLAMA_ARG_PLE_CACHE_ROWS"));
+    add_opt(common_arg(
+        {"--ple-direct-io"},
+        "use O_DIRECT for --ple-stream table reads (bypass the page cache); "
+        "falls back to buffered reads if O_DIRECT is unsupported by the OS or filesystem; implies --ple-stream",
+        [](common_params & params) {
+            params.ple_stream = true;
+            params.ple_direct_io = true;
+        }
+    ).set_env("LLAMA_ARG_PLE_DIRECT_IO"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

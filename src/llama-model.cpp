@@ -2817,6 +2817,9 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.moe_stream                  =*/ false,
+        /*.ple_cache_rows            =*/ 1 << 20,
+        /*.ple_direct_io             =*/ false,
+        /*.ple_stream                =*/ false,
     };
 
     return result;
