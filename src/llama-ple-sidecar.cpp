@@ -65,37 +65,41 @@ llama_ple_sidecar_manifest llama_ple_sidecar_load(const std::string & user_path)
     }
 
     llama_ple_sidecar_manifest out;
-    out.row_dim       = j.value("embedding_row_dimension", (int64_t) 0);
-    out.storage_dtype = j.value("storage_dtype", std::string());
-
     const fs::path manifest_dir = manifest_path.parent_path();
 
-    for (const auto & pf : j.at("physical_files")) {
-        llama_ple_sidecar_file file;
-        file.path       = resolve_physical_file(manifest_dir, pf.at("path").get<std::string>()).string();
-        file.file_bytes = pf.value("file_bytes", (uint64_t) 0);
-        out.files.push_back(std::move(file));
-    }
+    try {
+        out.row_dim       = j.value("embedding_row_dimension", (int64_t) 0);
+        out.storage_dtype = j.value("storage_dtype", std::string());
 
-    for (const auto & lp : j.at("logical_parts")) {
-        llama_ple_sidecar_segment seg;
-        seg.global_row_start = lp.at("global_row_start").get<int64_t>();
-        seg.rows             = lp.at("rows").get<int64_t>();
-        seg.file_index       = lp.at("physical_file_index").get<uint32_t>();
-        seg.file_offset      = lp.at("file_offset").get<uint64_t>();
-
-        if (seg.file_index >= out.files.size()) {
-            throw std::runtime_error("PLE sidecar manifest logical_part references an out-of-range physical_file_index");
+        for (const auto & pf : j.at("physical_files")) {
+            llama_ple_sidecar_file file;
+            file.path       = resolve_physical_file(manifest_dir, pf.at("path").get<std::string>()).string();
+            file.file_bytes = pf.value("file_bytes", (uint64_t) 0);
+            out.files.push_back(std::move(file));
         }
 
-        const uint64_t stride = lp.value("row_stride_bytes", (uint64_t) 0);
-        if (out.row_stride == 0) {
-            out.row_stride = stride;
-        } else if (stride != 0 && stride != out.row_stride) {
-            throw std::runtime_error("PLE sidecar manifest has inconsistent row_stride_bytes across logical_parts");
-        }
+        for (const auto & lp : j.at("logical_parts")) {
+            llama_ple_sidecar_segment seg;
+            seg.global_row_start = lp.at("global_row_start").get<int64_t>();
+            seg.rows             = lp.at("rows").get<int64_t>();
+            seg.file_index       = lp.at("physical_file_index").get<uint32_t>();
+            seg.file_offset      = lp.at("file_offset").get<uint64_t>();
 
-        out.segments.push_back(seg);
+            if (seg.file_index >= out.files.size()) {
+                throw std::runtime_error("PLE sidecar manifest logical_part references an out-of-range physical_file_index");
+            }
+
+            const uint64_t stride = lp.value("row_stride_bytes", (uint64_t) 0);
+            if (out.row_stride == 0) {
+                out.row_stride = stride;
+            } else if (stride != 0 && stride != out.row_stride) {
+                throw std::runtime_error("PLE sidecar manifest has inconsistent row_stride_bytes across logical_parts");
+            }
+
+            out.segments.push_back(seg);
+        }
+    } catch (const json::exception & e) {
+        throw std::runtime_error("PLE sidecar manifest has invalid field data (" + manifest_path.string() + "): " + e.what());
     }
 
     if (out.segments.empty() || out.row_stride == 0) {

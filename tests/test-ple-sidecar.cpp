@@ -136,6 +136,17 @@ static void test_errors() {
     write_sized_file(dir + "/a.bin", 8); // needs 16
     expect_throws([&] { llama_ple_sidecar_load(dir); });
 
+    // manifest with missing required field in logical_parts
+    write_manifest(dir + "/ple-manifest.json", R"JSON({
+      "storage_dtype": "F16", "embedding_row_dimension": 4,
+      "physical_files": [ { "index": 0, "path": "a.bin", "file_bytes": 16 } ],
+      "logical_parts": [
+        { "physical_file_index": 0, "rows": 2, "file_offset": 0, "row_stride_bytes": 8 }
+      ]
+    })JSON");
+    write_sized_file(dir + "/a.bin", 16);
+    expect_throws([&] { llama_ple_sidecar_load(dir); });
+
     std::remove((dir + "/a.bin").c_str());
     std::remove((dir + "/ple-manifest.json").c_str());
 
