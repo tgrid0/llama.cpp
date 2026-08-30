@@ -2820,6 +2820,7 @@ llama_model_params llama_model_default_params() {
         /*.ple_cache_rows            =*/ 1 << 20,
         /*.ple_direct_io             =*/ false,
         /*.ple_stream                =*/ false,
+        /*.ple_path                 =*/ nullptr,
     };
 
     return result;

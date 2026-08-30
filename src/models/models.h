@@ -2326,6 +2326,11 @@ struct llama_model_qwen4exp : public llama_model_base {
     // per_layer_tok_embd stays null then: the graph gathers through this stream.
     std::unique_ptr<llama_ple_stream> ple_stream;
 
+    // true once load_arch_tensors resolved a PLE table (sidecar or embedded); false
+    // means the model declares PLE-gated layers but no table was found - the gating
+    // block is skipped at graph-build time instead of crashing (PLE is optional).
+    bool ple_table_available = false;
+
     ~llama_model_qwen4exp() override;
 
     struct graph : public llm_build_delta_net_base {

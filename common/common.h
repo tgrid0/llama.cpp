@@ -583,6 +583,7 @@ struct common_params {
     uint32_t ple_cache_rows      = 1 << 20; // PLE n-gram row cache slots (0 = disabled)
     bool     ple_direct_io       = false;   // use O_DIRECT for PLE table reads (bypass page cache)
     bool     ple_stream          = false;   // stream the PLE n-gram table from disk on demand
+    std::string ple_path; // external SSD-PLE sidecar directory/manifest (qwen4exp)
 
     bool single_turn       = false; // single turn chat conversation
 

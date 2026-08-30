@@ -3,8 +3,10 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-ple-stream.h"
+#include "llama-ple-sidecar.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // NextN/MTP draft head, the deepseek4 pattern: the KV is optional and a missing tensor
@@ -134,32 +136,61 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto * ple_w = ml.get_weight(ple_name.c_str());
-        GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
-        const int64_t ple_rows = ple_w->tensor->ne[1];
 
-        if (params.ple_stream) {
-            // stream the table from the GGUF on demand: register the skip so the
-            // loader accounting stays consistent; no buffer is allocated, no data
-            // is loaded. the buft lists are unused for a TENSOR_STREAMED skip.
-            ml.create_tensor(hparams, nullptr, nullptr, nullptr, nullptr,
-                    tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                    { hparams.ple_head_dim, ple_rows }, TENSOR_STREAMED);
+        if (params.ple_path != nullptr && params.ple_path[0] != '\0') {
+            try {
+                const llama_ple_sidecar_manifest manifest = llama_ple_sidecar_load(params.ple_path);
+                const enum ggml_type sidecar_type = llama_ple_sidecar_dtype(manifest.storage_dtype);
 
-            ple_stream = std::make_unique<llama_ple_stream>(
-                    ml.file_paths[ple_w->idx].c_str(), ple_w->offs, ple_rows,
-                    hparams.ple_head_dim, ple_w->tensor->type,
-                    params.ple_cache_rows, params.ple_direct_io);
+                ple_stream = std::make_unique<llama_ple_stream>(
+                        manifest, hparams.ple_head_dim, sidecar_type,
+                        params.ple_cache_rows, params.ple_direct_io);
 
-            // per_layer_tok_embd stays nullptr: build_ple gathers through
-            // ple_stream, which forces the host-gather path
-        } else {
-            // the PLE/engram table is gathered 16 random rows per token and never
-            // read densely, so it wants MADV_RANDOM and no eager pull-in. See
-            // --tensor-read-lazy.
-            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                LLAMA_LOG_INFO("%s: PLE n-gram table loaded from sidecar %s (%" PRId64 " rows across %zu files)\n",
+                        __func__, params.ple_path, manifest.n_rows, manifest.files.size());
+                ple_table_available = true;
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: --ple %s could not be loaded (%s), falling back to the model's embedded PLE table\n",
+                        __func__, params.ple_path, e.what());
+            }
         }
+
+        if (!ple_table_available) {
+            const auto * ple_w = ml.get_weight(ple_name.c_str());
+            if (ple_w == nullptr) {
+                LLAMA_LOG_WARN("%s: qwen4exp declares PLE layers but no PLE n-gram table was found "
+                        "(no --ple sidecar, no embedded '%s' tensor); continuing without it, "
+                        "output quality will be reduced\n", __func__, ple_name.c_str());
+            } else {
+                const int64_t ple_rows = ple_w->tensor->ne[1];
+
+                if (params.ple_stream) {
+                    // stream the table from the GGUF on demand: register the skip so the
+                    // loader accounting stays consistent; no buffer is allocated, no data
+                    // is loaded. the buft lists are unused for a TENSOR_STREAMED skip.
+                    ml.create_tensor(hparams, nullptr, nullptr, nullptr, nullptr,
+                            tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                            { hparams.ple_head_dim, ple_rows }, TENSOR_STREAMED);
+
+                    ple_stream = std::make_unique<llama_ple_stream>(
+                            ml.file_paths[ple_w->idx].c_str(), ple_w->offs, ple_rows,
+                            hparams.ple_head_dim, ple_w->tensor->type,
+                            params.ple_cache_rows, params.ple_direct_io);
+
+                    // per_layer_tok_embd stays nullptr: build_ple gathers through
+                    // ple_stream, which forces the host-gather path
+                } else {
+                    // the PLE/engram table is gathered 16 random rows per token and never
+                    // read densely, so it wants MADV_RANDOM and no eager pull-in. See
+                    // --tensor-read-lazy.
+                    per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                                       { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                }
+                ple_table_available = true;
+            }
+        }
+    } else if (params.ple_path != nullptr && params.ple_path[0] != '\0') {
+        LLAMA_LOG_WARN("%s: --ple was given but this model has no PLE layers, ignoring it\n", __func__);
     }
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
@@ -372,7 +403,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
-        if (hparams.is_ple(il)) {
+        if (hparams.is_ple(il) && static_cast<const llama_model_qwen4exp &>(model).ple_table_available) {
             res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
         }
 

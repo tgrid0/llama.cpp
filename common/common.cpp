@@ -1693,6 +1693,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.ple_cache_rows      = params.ple_cache_rows;
     mparams.ple_direct_io       = params.ple_direct_io;
     mparams.ple_stream          = params.ple_stream;
+    mparams.ple_path = params.ple_path.empty() ? nullptr : params.ple_path.c_str();
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

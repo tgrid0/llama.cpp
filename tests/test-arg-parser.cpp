@@ -118,6 +118,7 @@ static void test(void) {
         assert(args.count("--ple-stream") == 1);
         assert(args.count("--ple-cache-rows") == 1);
         assert(args.count("--ple-direct-io") == 1);
+        assert(args.count("--ple") == 1);
     }
 
     auto list_str_to_char = [](std::vector<std::string> & argv) -> std::vector<char *> {

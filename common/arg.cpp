@@ -2813,9 +2813,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ple-stream"},
         "stream the PLE n-gram table from the GGUF on demand instead of loading it (qwen4exp); "
-        "keeps the table out of RAM (use with --load-mode none or dio); bypasses the mmap lazy-read path; "
-        "the table must be a tensor in the model's own GGUF (or one of its --split shards), "
-        "not a separate sidecar file",
+        "keeps the table out of RAM (use with --load-mode none or dio); bypasses the mmap lazy-read path",
         [](common_params & params) {
             params.ple_stream = true;
         }
@@ -2842,6 +2840,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ple_direct_io = true;
         }
     ).set_env("LLAMA_ARG_PLE_DIRECT_IO"));
+    add_opt(common_arg(
+        {"--ple"}, "PATH",
+        "load the PLE n-gram table (qwen4exp) from an external SSD-PLE sidecar directory "
+        "or manifest (a ple-manifest.json plus its .bin shards, the ds4-dfm SSD-PLE format) "
+        "instead of the model's own GGUF; falls back to the model's embedded table if the "
+        "sidecar cannot be loaded, and to running without a PLE table if neither is found; "
+        "implies --ple-stream",
+        [](common_params & params, const std::string & value) {
+            params.ple_stream = true;
+            params.ple_path = value;
+        }
+    ).set_env("LLAMA_ARG_PLE_PATH"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

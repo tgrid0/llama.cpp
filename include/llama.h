@@ -361,6 +361,10 @@ extern "C" {
         uint32_t ple_cache_rows;  // row cache slots (0 = disabled)
         bool     ple_direct_io;   // use O_DIRECT for PLE reads (bypass page cache); falls back if unsupported
         bool     ple_stream;      // stream the PLE n-gram table from disk on demand
+
+        // external SSD-PLE sidecar directory/manifest (qwen4exp); NULL or empty falls
+        // back to the model's embedded PLE table. Implies ple_stream = true.
+        const char * ple_path;
     };
 
     struct llama_sampler_seq_config {
