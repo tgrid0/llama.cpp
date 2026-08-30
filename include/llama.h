@@ -364,7 +364,8 @@ extern "C" {
 
         // external SSD-PLE sidecar directory/manifest (qwen4exp); NULL or empty falls
         // back to the model's embedded PLE table. The --ple CLI flag also sets
-        // ple_stream = true; a direct API caller must set both fields itself.
+        // ple_stream = true; a direct API caller should set ple_stream too if the
+        // embedded-table fallback should also stream rather than load eagerly.
         const char * ple_path;
     };
 
