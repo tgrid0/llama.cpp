@@ -2813,7 +2813,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ple-stream"},
         "stream the PLE n-gram table from the GGUF on demand instead of loading it (qwen4exp); "
-        "keeps the table out of RAM (use with --load-mode none or dio); bypasses the mmap lazy-read path",
+        "keeps the table out of RAM (use with --load-mode none or dio); bypasses the mmap lazy-read path; "
+        "the table must be a tensor in the model's own GGUF (or one of its --split shards), "
+        "not a separate sidecar file",
         [](common_params & params) {
             params.ple_stream = true;
         }

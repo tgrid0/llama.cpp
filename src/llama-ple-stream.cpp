@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
@@ -102,17 +103,23 @@ llama_ple_stream::llama_ple_stream(
     n_rows_   = n_rows;
     head_dim_ = head_dim;
     type_     = type;
-    n_cache_rows_ = n_cache_rows;
+    // a cache with more slots than the table has rows cannot improve the hit rate
+    // (every row already has its own slot at n_cache_rows_ == n_rows_) and only
+    // wastes host memory, which matters here since the whole point of streaming
+    // is a bounded, user-controlled footprint
+    n_cache_rows_ = (int64_t) std::min<uint64_t>(n_cache_rows, (uint64_t) n_rows_);
+    if (n_cache_rows_ < (int64_t) n_cache_rows) {
+        LLAMA_LOG_WARN("%s: --ple-cache-rows %u exceeds the table's %" PRId64 " rows, clamping\n",
+                __func__, n_cache_rows, n_rows_);
+    }
 
     if (n_cache_rows_ > 0) {
         cache_.resize((size_t) n_cache_rows_ * row_size_);
         cache_tags_.assign(n_cache_rows_, -1);
     }
-    row_buf_ = (uint8_t *) ple_aligned_alloc(row_size_ + 2 * PLE_STREAM_DIRECT_ALIGN);
-    if (row_buf_ == nullptr) {
-        throw std::runtime_error("PLE table streaming allocation failed");
-    }
 
+    // opened and validated before row_buf_ is allocated: both can throw, and row_buf_
+    // is a raw pointer (no RAII), so allocating it first would leak on those paths
     auto open = [&](bool direct) {
         file_ = std::make_unique<llama_file>(path, "rb", direct);
     };
@@ -135,6 +142,11 @@ llama_ple_stream::llama_ple_stream(
 
     if (offs_ + (size_t) n_rows_ * row_size_ > file_->size()) {
         throw std::runtime_error("PLE table data is not within the file bounds, model is corrupted or incomplete");
+    }
+
+    row_buf_ = (uint8_t *) ple_aligned_alloc(row_size_ + 2 * PLE_STREAM_DIRECT_ALIGN);
+    if (row_buf_ == nullptr) {
+        throw std::runtime_error("PLE table streaming allocation failed");
     }
 
     if (use_direct_io_) {
