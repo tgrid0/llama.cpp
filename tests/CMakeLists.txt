@@ -283,6 +283,7 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 # internal (non-LLAMA_API) class, not exported on Windows shared builds
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-ple-stream.cpp)
+    llama_build_and_test(test-ple-sidecar.cpp)
 endif()
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 

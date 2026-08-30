@@ -38,6 +38,7 @@ add_library(llama
             llama-model.cpp
             llama-moe-stream.cpp
             llama-ple-stream.cpp
+            llama-ple-sidecar.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
@@ -59,6 +60,7 @@ target_compile_definitions(llama PRIVATE
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
