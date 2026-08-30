@@ -85,6 +85,7 @@ private:
     };
 
     void init_cache(uint32_t n_cache_rows);
+    void alloc_row_buf();
     void open_files(const std::vector<std::string> & paths, bool use_direct_io);
     void resolve(int32_t row, llama_file *& file, size_t & offs) const;
     bool read_row(int32_t row, int64_t slot, const uint8_t * & src);

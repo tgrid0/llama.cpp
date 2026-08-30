@@ -89,6 +89,8 @@ static const uint8_t * ple_pread(llama_file & file, uint8_t * staging, size_t le
 #endif
 }
 
+// clamps n_cache_rows to the table size (warning if it had to), and sizes the
+// cache buffers; does not touch row_buf_ (see alloc_row_buf() for why)
 void llama_ple_stream::init_cache(uint32_t n_cache_rows) {
     // a cache with more slots than the table has rows cannot improve the hit rate
     // (every row already has its own slot at n_cache_rows_ == n_rows_) and only
@@ -104,7 +106,12 @@ void llama_ple_stream::init_cache(uint32_t n_cache_rows) {
         cache_.resize((size_t) n_cache_rows_ * row_size_);
         cache_tags_.assign(n_cache_rows_, -1);
     }
+}
 
+// allocates row_buf_; callers must call this last, after every other throwing
+// step in the constructor has already succeeded - row_buf_ is a raw pointer
+// (no RAII), so allocating it earlier would leak it if a later step threw
+void llama_ple_stream::alloc_row_buf() {
     row_buf_ = (uint8_t *) ple_aligned_alloc(row_size_ + 2 * PLE_STREAM_DIRECT_ALIGN);
     if (row_buf_ == nullptr) {
         throw std::runtime_error("PLE table streaming allocation failed");
@@ -139,10 +146,6 @@ void llama_ple_stream::open_files(const std::vector<std::string> & paths, bool u
         }
     }
     use_direct_io_ = use_direct_io;
-
-    if (use_direct_io_) {
-        LLAMA_LOG_INFO("%s: PLE table streaming uses O_DIRECT (page cache bypassed)\n", __func__);
-    }
 }
 
 llama_ple_stream::llama_ple_stream(
@@ -160,8 +163,13 @@ llama_ple_stream::llama_ple_stream(
     head_dim_ = head_dim;
     type_     = type;
 
-    // opened and validated before row_buf_/cache_ are allocated: both can throw, and
-    // row_buf_ is a raw pointer (no RAII), so allocating it first would leak on those paths
+    // clamp/warn on --ple-cache-rows and size the cache buffers before opening the
+    // file, so the clamp warning (if any) always prints before any O_DIRECT log
+    init_cache(n_cache_rows);
+
+    // opens (and, on a failed O_DIRECT probe, reopens buffered) before the bounds
+    // check below runs, so a bounds-check throw here never emits a misleading
+    // "streaming enabled" log for a stream that was never actually built
     open_files({ path }, use_direct_io);
 
     if (offs + (size_t) n_rows_ * row_size_ > files_[0]->size()) {
@@ -169,8 +177,12 @@ llama_ple_stream::llama_ple_stream(
     }
     segments_.push_back({ 0, n_rows_, 0, offs });
 
-    init_cache(n_cache_rows);
+    // last throwing step, once nothing above it can still fail
+    alloc_row_buf();
 
+    if (use_direct_io_) {
+        LLAMA_LOG_INFO("%s: PLE table streaming uses O_DIRECT (page cache bypassed)\n", __func__);
+    }
     if (n_cache_rows_ > 0) {
         LLAMA_LOG_INFO("%s: PLE table streaming enabled, %" PRId64 " rows, %" PRId64 " row cache slots (%.2f MiB)\n",
                 __func__, n_rows_, (int64_t) n_cache_rows_, (double) cache_.size() / (1024.0 * 1024.0));
@@ -194,6 +206,11 @@ llama_ple_stream::llama_ple_stream(
     head_dim_ = head_dim;
     type_     = type;
 
+    // same ordering rationale as the single-file constructor: clamp/warn on the
+    // cache size first, open (and validate) every file next, and only declare
+    // success - the O_DIRECT and "enabled" logs - once nothing left can throw
+    init_cache(n_cache_rows);
+
     std::vector<std::string> paths;
     for (const auto & file : manifest.files) {
         paths.push_back(file.path);
@@ -208,8 +225,11 @@ llama_ple_stream::llama_ple_stream(
         segments_.push_back({ seg.global_row_start, seg.rows, seg.file_index, seg.file_offset });
     }
 
-    init_cache(n_cache_rows);
+    alloc_row_buf();
 
+    if (use_direct_io_) {
+        LLAMA_LOG_INFO("%s: PLE table streaming uses O_DIRECT (page cache bypassed)\n", __func__);
+    }
     if (n_cache_rows_ > 0) {
         LLAMA_LOG_INFO("%s: PLE sidecar streaming enabled, %" PRId64 " rows across %zu files, "
                 "%" PRId64 " row cache slots (%.2f MiB)\n",
@@ -243,7 +263,11 @@ void llama_ple_stream::resolve(int32_t row, llama_file *& file, size_t & offs) c
 // read row into the cache slot (slot >= 0) or into row_buf_ (slot < 0); sets src
 // to the row bytes
 bool llama_ple_stream::read_row(int32_t row, int64_t slot, const uint8_t * & src) {
-    // a direct read failure may have switched the file to buffered I/O
+    // files_[0] approximates every file's I/O mode: they are opened together, so
+    // this is normally accurate. A per-file mid-stream O_DIRECT failure can desync
+    // files_[0] from another file's actual state, but that only costs one wasted
+    // O_DIRECT-style read attempt on the desynced file - its fd stays valid and the
+    // read still returns correct data either way, so no correctness risk follows.
     if (use_direct_io_ && !files_[0]->has_direct_io()) {
         use_direct_io_ = false;
     }

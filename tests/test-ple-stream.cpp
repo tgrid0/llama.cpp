@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "llama.h"
 
 #include "../src/llama-ple-stream.h"
 #include "../src/llama-ple-sidecar.h"
@@ -177,6 +178,80 @@ static void test_ctor_errors() {
     std::remove(path.c_str());
 }
 
+// captures every log line emitted while installed, to check log statement order
+static void capture_log_lines(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    static_cast<std::vector<std::string> *>(user_data)->push_back(text);
+}
+
+// index of the first captured line containing needle, or -1
+static int log_find(const std::vector<std::string> & logs, const char * needle) {
+    for (size_t i = 0; i < logs.size(); ++i) {
+        if (logs[i].find(needle) != std::string::npos) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+// regression test: a prior refactor reordered the single-file constructor's log
+// statements so the --ple-cache-rows clamp WARN could print after the
+// O_DIRECT-enabled INFO log instead of before it. head_dim is large enough that
+// the file is >= 4096 bytes so the O_DIRECT probe (a 4096-byte read at offset 0)
+// succeeds and O_DIRECT stays enabled, exercising both log lines together.
+static void test_ctor_log_order_clamp_before_direct_io() {
+    const std::string path = "ple-test-log-order.bin";
+    const int64_t head_dim = 1024, n_rows = 8;
+    write_f16_rows(path, n_rows, head_dim);
+
+    std::vector<std::string> logs;
+    ggml_log_callback prev_cb = nullptr;
+    void * prev_ud = nullptr;
+    ggml_log_get(&prev_cb, &prev_ud);
+    llama_log_set(capture_log_lines, &logs);
+
+    {
+        llama_ple_stream s(path.c_str(), 0, n_rows, head_dim, GGML_TYPE_F16, (uint32_t) n_rows + 10, true);
+    }
+
+    llama_log_set(prev_cb, prev_ud);
+
+    const int i_clamp   = log_find(logs, "clamping");
+    const int i_direct  = log_find(logs, "uses O_DIRECT");
+    const int i_enabled = log_find(logs, "streaming enabled");
+    assert(i_clamp >= 0 && i_direct >= 0 && i_enabled >= 0);
+    assert(i_clamp < i_direct);
+    assert(i_direct < i_enabled);
+
+    std::remove(path.c_str());
+}
+
+// regression test: the same refactor made the "uses O_DIRECT" INFO log print
+// unconditionally inside open_files(), before the bounds check that runs after it
+// in the constructor - so it printed even on a path where the bounds check then
+// throws and the object is never built. n_rows is set far beyond what the file
+// holds so the bounds check throws.
+static void test_ctor_log_order_no_log_before_throw() {
+    const std::string path = "ple-test-log-order-throw.bin";
+    const int64_t head_dim = 1024, n_rows = 8;
+    write_f16_rows(path, n_rows, head_dim);
+
+    std::vector<std::string> logs;
+    ggml_log_callback prev_cb = nullptr;
+    void * prev_ud = nullptr;
+    ggml_log_get(&prev_cb, &prev_ud);
+    llama_log_set(capture_log_lines, &logs);
+
+    expect_throws([&] { llama_ple_stream s(path.c_str(), 0, n_rows * 100, head_dim, GGML_TYPE_F16, 0, true); });
+
+    llama_log_set(prev_cb, prev_ud);
+
+    assert(log_find(logs, "uses O_DIRECT") < 0);
+    assert(log_find(logs, "streaming enabled") < 0);
+
+    std::remove(path.c_str());
+}
+
 // builds a 2-file sidecar manifest by hand (bypassing llama_ple_sidecar_load's file
 // I/O) to test llama_ple_stream's multi-file addressing directly
 static llama_ple_sidecar_manifest make_two_file_manifest(
@@ -244,6 +319,8 @@ int main() {
     test_ctor_errors();
     test_sidecar_two_files();
     test_sidecar_dim_mismatch();
+    test_ctor_log_order_clamp_before_direct_io();
+    test_ctor_log_order_no_log_before_throw();
     printf("test-ple-stream: all tests passed\n");
     return 0;
 }
