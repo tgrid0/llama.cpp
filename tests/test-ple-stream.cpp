@@ -2,10 +2,12 @@
 #include "ggml-cpp.h"
 
 #include "../src/llama-ple-stream.h"
+#include "../src/llama-ple-sidecar.h"
 
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -175,11 +177,73 @@ static void test_ctor_errors() {
     std::remove(path.c_str());
 }
 
+// builds a 2-file sidecar manifest by hand (bypassing llama_ple_sidecar_load's file
+// I/O) to test llama_ple_stream's multi-file addressing directly
+static llama_ple_sidecar_manifest make_two_file_manifest(
+        const std::string & path_a, const std::string & path_b, int64_t head_dim) {
+    llama_ple_sidecar_manifest m;
+    m.storage_dtype = "F16";
+    m.row_dim       = head_dim;
+    m.row_stride    = ggml_row_size(GGML_TYPE_F16, head_dim);
+    m.files         = { { path_a, 4 * m.row_stride }, { path_b, 4 * m.row_stride } };
+    m.segments      = {
+        { 0, 4, 0, 0 },
+        { 4, 4, 1, 0 },
+    };
+    m.n_rows = 8;
+    return m;
+}
+
+static void test_sidecar_two_files() {
+    const std::string path_a = "ple-test-sidecar-a.bin";
+    const std::string path_b = "ple-test-sidecar-b.bin";
+    const int64_t head_dim = 4;
+
+    // file a holds rows [0,4) with values 0..3, file b holds rows [4,8) with values 4..7
+    write_f16_rows(path_a, 4, head_dim);
+    {
+        FILE * f = fopen(path_b.c_str(), "wb");
+        assert(f != nullptr);
+        std::vector<ggml_fp16_t> row(head_dim);
+        for (int64_t r = 0; r < 4; ++r) {
+            for (int64_t e = 0; e < head_dim; ++e) {
+                row[e] = ggml_fp32_to_fp16((float) (r + 4));
+            }
+            fwrite(row.data(), sizeof(ggml_fp16_t), (size_t) head_dim, f);
+        }
+        fclose(f);
+    }
+
+    const auto manifest = make_two_file_manifest(path_a, path_b, head_dim);
+    llama_ple_stream s(manifest, head_dim, GGML_TYPE_F16, 8, false);
+
+    const std::vector<int32_t> idx = { 0, 4, 3, 7 };
+    std::vector<float> dst(head_dim * idx.size());
+    assert(s.gather(idx.data(), idx.size(), dst.data()));
+    check_dst(dst, idx, head_dim);
+
+    std::remove(path_a.c_str());
+    std::remove(path_b.c_str());
+}
+
+static void test_sidecar_dim_mismatch() {
+    const std::string path_a = "ple-test-sidecar-mismatch.bin";
+    write_f16_rows(path_a, 4, 4);
+    auto manifest = make_two_file_manifest(path_a, path_a, 4);
+
+    // caller-expected head_dim (8) does not match the manifest's row_dim (4)
+    expect_throws([&] { llama_ple_stream s(manifest, 8, GGML_TYPE_F16, 0, false); });
+
+    std::remove(path_a.c_str());
+}
+
 int main() {
     test_f16();
     test_q8();
     test_truncated();
     test_ctor_errors();
+    test_sidecar_two_files();
+    test_sidecar_dim_mismatch();
     printf("test-ple-stream: all tests passed\n");
     return 0;
 }

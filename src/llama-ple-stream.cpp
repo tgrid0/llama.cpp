@@ -1,6 +1,7 @@
 #include "llama-ple-stream.h"
 
 #include "llama-impl.h"
+#include "llama-ple-sidecar.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -88,21 +89,7 @@ static const uint8_t * ple_pread(llama_file & file, uint8_t * staging, size_t le
 #endif
 }
 
-llama_ple_stream::llama_ple_stream(
-        const char * path, size_t offs, int64_t n_rows, int64_t head_dim,
-        enum ggml_type type, uint32_t n_cache_rows, bool use_direct_io) {
-    if (path == nullptr || path[0] == '\0') {
-        throw std::runtime_error("PLE table streaming requires a file-based model (not a stream/file descriptor)");
-    }
-    if (n_rows <= 0 || head_dim <= 0) {
-        throw std::runtime_error("PLE table has invalid dimensions");
-    }
-
-    offs_     = offs;
-    row_size_ = ggml_row_size(type, head_dim);
-    n_rows_   = n_rows;
-    head_dim_ = head_dim;
-    type_     = type;
+void llama_ple_stream::init_cache(uint32_t n_cache_rows) {
     // a cache with more slots than the table has rows cannot improve the hit rate
     // (every row already has its own slot at n_cache_rows_ == n_rows_) and only
     // wastes host memory, which matters here since the whole point of streaming
@@ -118,45 +105,118 @@ llama_ple_stream::llama_ple_stream(
         cache_tags_.assign(n_cache_rows_, -1);
     }
 
-    // opened and validated before row_buf_ is allocated: both can throw, and row_buf_
-    // is a raw pointer (no RAII), so allocating it first would leak on those paths
-    auto open = [&](bool direct) {
-        file_ = std::make_unique<llama_file>(path, "rb", direct);
-    };
-
-    open(use_direct_io);
-    if (use_direct_io) {
-        bool ok = file_->has_direct_io();
-        if (ok) {
-            uint8_t * probe = (uint8_t *) ple_aligned_alloc(PLE_STREAM_DIRECT_ALIGN);
-            ok = probe != nullptr && ple_pread(*file_, probe, PLE_STREAM_DIRECT_ALIGN, 0, true) != nullptr;
-            ple_aligned_free(probe);
-        }
-        if (!ok) {
-            LLAMA_LOG_WARN("%s: O_DIRECT not usable for the PLE table, falling back to buffered reads\n", __func__);
-            use_direct_io = false;
-            open(false);
-        }
-    }
-    use_direct_io_ = use_direct_io;
-
-    if (offs_ + (size_t) n_rows_ * row_size_ > file_->size()) {
-        throw std::runtime_error("PLE table data is not within the file bounds, model is corrupted or incomplete");
-    }
-
     row_buf_ = (uint8_t *) ple_aligned_alloc(row_size_ + 2 * PLE_STREAM_DIRECT_ALIGN);
     if (row_buf_ == nullptr) {
         throw std::runtime_error("PLE table streaming allocation failed");
     }
+}
+
+void llama_ple_stream::open_files(const std::vector<std::string> & paths, bool use_direct_io) {
+    for (const auto & path : paths) {
+        files_.push_back(std::make_unique<llama_file>(path.c_str(), "rb", use_direct_io));
+    }
+
+    if (use_direct_io) {
+        bool ok = true;
+        for (auto & file : files_) {
+            ok = ok && file->has_direct_io();
+        }
+        if (ok) {
+            uint8_t * probe = (uint8_t *) ple_aligned_alloc(PLE_STREAM_DIRECT_ALIGN);
+            ok = probe != nullptr;
+            for (auto & file : files_) {
+                ok = ok && ple_pread(*file, probe, PLE_STREAM_DIRECT_ALIGN, 0, true) != nullptr;
+            }
+            ple_aligned_free(probe);
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: O_DIRECT not usable for the PLE table, falling back to buffered reads\n", __func__);
+            files_.clear();
+            for (const auto & path : paths) {
+                files_.push_back(std::make_unique<llama_file>(path.c_str(), "rb", false));
+            }
+            use_direct_io = false;
+        }
+    }
+    use_direct_io_ = use_direct_io;
 
     if (use_direct_io_) {
         LLAMA_LOG_INFO("%s: PLE table streaming uses O_DIRECT (page cache bypassed)\n", __func__);
     }
+}
+
+llama_ple_stream::llama_ple_stream(
+        const char * path, size_t offs, int64_t n_rows, int64_t head_dim,
+        enum ggml_type type, uint32_t n_cache_rows, bool use_direct_io) {
+    if (path == nullptr || path[0] == '\0') {
+        throw std::runtime_error("PLE table streaming requires a file-based model (not a stream/file descriptor)");
+    }
+    if (n_rows <= 0 || head_dim <= 0) {
+        throw std::runtime_error("PLE table has invalid dimensions");
+    }
+
+    row_size_ = ggml_row_size(type, head_dim);
+    n_rows_   = n_rows;
+    head_dim_ = head_dim;
+    type_     = type;
+
+    // opened and validated before row_buf_/cache_ are allocated: both can throw, and
+    // row_buf_ is a raw pointer (no RAII), so allocating it first would leak on those paths
+    open_files({ path }, use_direct_io);
+
+    if (offs + (size_t) n_rows_ * row_size_ > files_[0]->size()) {
+        throw std::runtime_error("PLE table data is not within the file bounds, model is corrupted or incomplete");
+    }
+    segments_.push_back({ 0, n_rows_, 0, offs });
+
+    init_cache(n_cache_rows);
+
     if (n_cache_rows_ > 0) {
         LLAMA_LOG_INFO("%s: PLE table streaming enabled, %" PRId64 " rows, %" PRId64 " row cache slots (%.2f MiB)\n",
                 __func__, n_rows_, (int64_t) n_cache_rows_, (double) cache_.size() / (1024.0 * 1024.0));
     } else {
         LLAMA_LOG_INFO("%s: PLE table streaming enabled, %" PRId64 " rows, no row cache\n", __func__, n_rows_);
+    }
+}
+
+llama_ple_stream::llama_ple_stream(
+        const llama_ple_sidecar_manifest & manifest, int64_t head_dim,
+        enum ggml_type type, uint32_t n_cache_rows, bool use_direct_io) {
+    if (head_dim != manifest.row_dim) {
+        throw std::runtime_error("PLE sidecar embedding_row_dimension does not match the model's PLE head dim");
+    }
+
+    row_size_ = ggml_row_size(type, head_dim);
+    if (row_size_ != manifest.row_stride) {
+        throw std::runtime_error("PLE sidecar row_stride_bytes does not match the model's PLE dtype/head dim");
+    }
+    n_rows_   = manifest.n_rows;
+    head_dim_ = head_dim;
+    type_     = type;
+
+    std::vector<std::string> paths;
+    for (const auto & file : manifest.files) {
+        paths.push_back(file.path);
+    }
+    open_files(paths, use_direct_io);
+
+    for (const auto & seg : manifest.segments) {
+        const uint64_t need = seg.file_offset + (uint64_t) seg.rows * row_size_;
+        if (need > files_[seg.file_index]->size()) {
+            throw std::runtime_error("PLE sidecar segment is not within its physical file's bounds");
+        }
+        segments_.push_back({ seg.global_row_start, seg.rows, seg.file_index, seg.file_offset });
+    }
+
+    init_cache(n_cache_rows);
+
+    if (n_cache_rows_ > 0) {
+        LLAMA_LOG_INFO("%s: PLE sidecar streaming enabled, %" PRId64 " rows across %zu files, "
+                "%" PRId64 " row cache slots (%.2f MiB)\n",
+                __func__, n_rows_, files_.size(), (int64_t) n_cache_rows_, (double) cache_.size() / (1024.0 * 1024.0));
+    } else {
+        LLAMA_LOG_INFO("%s: PLE sidecar streaming enabled, %" PRId64 " rows across %zu files, no row cache\n",
+                __func__, n_rows_, files_.size());
     }
 }
 
@@ -169,15 +229,28 @@ llama_ple_stream::~llama_ple_stream() {
     ple_aligned_free(row_buf_);
 }
 
+// segments_ is sorted by global_row_start and covers [0, n_rows_) with no gaps, so a
+// binary search on the segment start finds the (single) owning segment
+void llama_ple_stream::resolve(int32_t row, llama_file *& file, size_t & offs) const {
+    auto it = std::upper_bound(segments_.begin(), segments_.end(), (int64_t) row,
+            [](int64_t r, const segment & s) { return r < s.global_row_start; });
+    GGML_ASSERT(it != segments_.begin());
+    --it;
+    file = files_[it->file_index].get();
+    offs = it->file_offset + (size_t) (row - it->global_row_start) * row_size_;
+}
+
 // read row into the cache slot (slot >= 0) or into row_buf_ (slot < 0); sets src
 // to the row bytes
 bool llama_ple_stream::read_row(int32_t row, int64_t slot, const uint8_t * & src) {
     // a direct read failure may have switched the file to buffered I/O
-    if (use_direct_io_ && !file_->has_direct_io()) {
+    if (use_direct_io_ && !files_[0]->has_direct_io()) {
         use_direct_io_ = false;
     }
 
-    const size_t offs = offs_ + (size_t) row * row_size_;
+    llama_file * file = nullptr;
+    size_t offs = 0;
+    resolve(row, file, offs);
 
     uint8_t * dst_buf = row_buf_;
     if (slot >= 0) {
@@ -186,7 +259,7 @@ bool llama_ple_stream::read_row(int32_t row, int64_t slot, const uint8_t * & src
 
     const uint8_t * p = nullptr;
     if (use_direct_io_) {
-        p = ple_pread(*file_, row_buf_, row_size_, offs, true);
+        p = ple_pread(*file, row_buf_, row_size_, offs, true);
         if (p == nullptr) {
             return false;
         }
@@ -198,7 +271,7 @@ bool llama_ple_stream::read_row(int32_t row, int64_t slot, const uint8_t * & src
             src = p;
         }
     } else {
-        p = ple_pread(*file_, dst_buf, row_size_, offs, false);
+        p = ple_pread(*file, dst_buf, row_size_, offs, false);
         if (p == nullptr) {
             return false;
         }
