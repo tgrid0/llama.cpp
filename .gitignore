@@ -155,3 +155,6 @@ AGENTS.local.md
 .pi/SYSTEM.md
 
 .claude/settings.local.json
+
+# agent worktrees
+.worktrees/
