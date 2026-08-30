@@ -312,6 +312,20 @@ static void test_sidecar_dim_mismatch() {
     std::remove(path_a.c_str());
 }
 
+// a hand-built manifest (not run through llama_ple_sidecar_load's own validation)
+// with a segment pointing past the end of the files list must not index out of bounds
+static void test_sidecar_bad_file_index() {
+    const std::string path_a = "ple-test-sidecar-bad-index.bin";
+    write_f16_rows(path_a, 4, 4);
+
+    auto manifest = make_two_file_manifest(path_a, path_a, 4);
+    manifest.segments[1].file_index = 2; // only files[0] and files[1] exist
+
+    expect_throws([&] { llama_ple_stream s(manifest, 4, GGML_TYPE_F16, 0, false); });
+
+    std::remove(path_a.c_str());
+}
+
 int main() {
     test_f16();
     test_q8();
@@ -319,6 +333,7 @@ int main() {
     test_ctor_errors();
     test_sidecar_two_files();
     test_sidecar_dim_mismatch();
+    test_sidecar_bad_file_index();
     test_ctor_log_order_clamp_before_direct_io();
     test_ctor_log_order_no_log_before_throw();
     printf("test-ple-stream: all tests passed\n");

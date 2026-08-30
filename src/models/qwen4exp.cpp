@@ -142,6 +142,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 const llama_ple_sidecar_manifest manifest = llama_ple_sidecar_load(params.ple_path);
                 const enum ggml_type sidecar_type = llama_ple_sidecar_dtype(manifest.storage_dtype);
 
+                // the sidecar is a separate artifact from the GGUF: a table shorter than the
+                // head ranges this model hashes into would assert inside gather() mid-decode
+                int64_t rows_needed = 0;
+                for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                    rows_needed = std::max(rows_needed,
+                            (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+                }
+                if (manifest.n_rows < rows_needed) {
+                    throw std::runtime_error("PLE sidecar has fewer rows than the model's PLE head ranges require");
+                }
+
                 ple_stream = std::make_unique<llama_ple_stream>(
                         manifest, hparams.ple_head_dim, sidecar_type,
                         params.ple_cache_rows, params.ple_direct_io);
@@ -166,6 +177,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
                 ple_table_available = true;
             } catch (const std::exception & e) {
+                ple_stream.reset();
                 LLAMA_LOG_WARN("%s: --ple %s could not be loaded (%s), will look for the model's embedded PLE table instead\n",
                         __func__, params.ple_path, e.what());
             }

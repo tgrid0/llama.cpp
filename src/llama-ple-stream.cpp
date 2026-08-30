@@ -218,6 +218,9 @@ llama_ple_stream::llama_ple_stream(
     open_files(paths, use_direct_io);
 
     for (const auto & seg : manifest.segments) {
+        if (seg.file_index >= files_.size()) {
+            throw std::runtime_error("PLE sidecar segment references an out-of-range physical file");
+        }
         const uint64_t need = seg.file_offset + (uint64_t) seg.rows * row_size_;
         if (need > files_[seg.file_index]->size()) {
             throw std::runtime_error("PLE sidecar segment is not within its physical file's bounds");
