@@ -363,7 +363,8 @@ extern "C" {
         bool     ple_stream;      // stream the PLE n-gram table from disk on demand
 
         // external SSD-PLE sidecar directory/manifest (qwen4exp); NULL or empty falls
-        // back to the model's embedded PLE table. Implies ple_stream = true.
+        // back to the model's embedded PLE table. The --ple CLI flag also sets
+        // ple_stream = true; a direct API caller must set both fields itself.
         const char * ple_path;
     };
 

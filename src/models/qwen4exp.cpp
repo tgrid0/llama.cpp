@@ -148,9 +148,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
                 LLAMA_LOG_INFO("%s: PLE n-gram table loaded from sidecar %s (%" PRId64 " rows across %zu files)\n",
                         __func__, params.ple_path, manifest.n_rows, manifest.files.size());
+
+                // the GGUF may still physically embed the table even though we are
+                // using the sidecar; register the skip so the loader's tensor-count
+                // accounting stays consistent, without touching ple_stream
+                const auto * ple_w = ml.get_weight(ple_name.c_str());
+                if (ple_w != nullptr) {
+                    if (ple_w->tensor->ne[1] != manifest.n_rows) {
+                        LLAMA_LOG_WARN("%s: embedded '%s' has %" PRId64 " rows but sidecar %s has %" PRId64
+                                " rows; using the sidecar data\n",
+                                __func__, ple_name.c_str(), ple_w->tensor->ne[1], params.ple_path, manifest.n_rows);
+                    }
+                    ml.create_tensor(hparams, nullptr, nullptr, nullptr, nullptr,
+                            tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                            { hparams.ple_head_dim, ple_w->tensor->ne[1] }, TENSOR_STREAMED);
+                }
+
                 ple_table_available = true;
             } catch (const std::exception & e) {
-                LLAMA_LOG_WARN("%s: --ple %s could not be loaded (%s), falling back to the model's embedded PLE table\n",
+                LLAMA_LOG_WARN("%s: --ple %s could not be loaded (%s), will look for the model's embedded PLE table instead\n",
                         __func__, params.ple_path, e.what());
             }
         }
