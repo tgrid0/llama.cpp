@@ -4,8 +4,9 @@
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
-    const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
+    // rows go on the x dispatch dim, which has a much higher device limit than y/z
+    const uint rowx = gl_WorkGroupID.x;
+    const uint wg_start = gl_WorkGroupID.y * BLOCK_SIZE * num_iters;
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
     const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
@@ -25,9 +26,9 @@ void main() {
     // Find max
     FLOAT_TYPE max_val = p.has_sinks == 0 ? uintBitsToFloat(0xFF800000) : data_c[i02];
 
-    [[unroll]] for (uint i = 0; i < gl_NumWorkGroups.x; i += BLOCK_SIZE) {
-        if (i + tid < gl_NumWorkGroups.x) {
-            max_val = max(max_val, data_m[rowx * gl_NumWorkGroups.x + i + tid]);
+    [[unroll]] for (uint i = 0; i < gl_NumWorkGroups.y; i += BLOCK_SIZE) {
+        if (i + tid < gl_NumWorkGroups.y) {
+            max_val = max(max_val, data_m[rowx * gl_NumWorkGroups.y + i + tid]);
         }
     }
 
@@ -74,6 +75,6 @@ void main() {
 
     if (tid == 0) {
         sum = vals[0];
-        data_s[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sum;
+        data_s[rowx * gl_NumWorkGroups.y + gl_WorkGroupID.y] = sum;
     }
 }

@@ -4,8 +4,9 @@
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
-    const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
+    // rows go on the x dispatch dim, which has a much higher device limit than y/z
+    const uint rowx = gl_WorkGroupID.x;
+    const uint wg_start = gl_WorkGroupID.y * BLOCK_SIZE * num_iters;
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
     const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
@@ -57,6 +58,6 @@ void main() {
 
     if (tid == 0) {
         max_val = vals[0];
-        data_m[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = max_val;
+        data_m[rowx * gl_NumWorkGroups.y + gl_WorkGroupID.y] = max_val;
     }
 }

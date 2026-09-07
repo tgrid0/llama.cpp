@@ -14176,7 +14176,9 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
 
-        std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
+        // nrows_x can exceed maxComputeWorkGroupCount[1] for long contexts, so it goes on dim 0,
+        // which has a much higher limit on common Vulkan implementations. See soft_max_large*.comp.
+        std::array<uint32_t, 3> elements = { nrows_x, num_wgs, 1 };
 
         vk_pipeline pipeline1 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large1_f32_f16 : ctx->device->pipeline_soft_max_large1_f32;
         vk_pipeline pipeline2 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large2_f32_f16 : ctx->device->pipeline_soft_max_large2_f32;
