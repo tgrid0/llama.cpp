@@ -7,6 +7,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-disk.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -216,7 +217,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
@@ -224,10 +226,31 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        if (params.ple_on_disk) {
+            if (!ple_w) {
+                throw std::runtime_error(format("%s: --ngram-on-disk requires %s to be present in the model file",
+                                                __func__, ple_name.c_str()));
+            }
 
-        ple_reader = load_lazy_reader(ml, ple_name.c_str(), per_layer_tok_embd);
+            // Counted as created but never allocated, mapped or read: each ubatch preads
+            // exactly the rows it gathers (llm_graph_input_ple::set_input).
+            llama_ple_disk::params dp;
+            dp.n_threads   = params.ple_io_threads;
+            dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
+            dp.direct_io   = params.ple_direct_io;
+
+            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
+                                                        ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
+            LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
+
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+        } else {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+
+            ple_reader = load_lazy_reader(ml, ple_name.c_str(), per_layer_tok_embd);
+        }
     }
 
     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
@@ -1686,11 +1709,20 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
-        return pmodel.ple_reader ? data->ne[1] == n : rows->ne[0] == n;
+        // exactly one of the three is built: `rows` for an in-graph get_rows, `data` for
+        // the lazy mmap reader, `embd` when --ngram-on-disk gathered it in set_input.
+        if (rows) { return rows->ne[0] == n; }
+        if (data) { return data->ne[1] == n; }
+        if (embd) { return embd->ne[1] == n; }
+        return false;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * data = nullptr;   // direct mode: staged rows [ple_head_dim, ple_n_heads * n_tokens]
+    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
+
+    std::vector<float>   embd_buf;
+    std::vector<int32_t> rows_global;
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1805,9 +1837,20 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
         pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
-    } else {
-        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        return;
     }
+
+    if (pmodel.ple_disk) {
+        // idx is already exactly what the reader wants: one global row per (token, head),
+        // token-major, with ple_head_offsets folded in by the loop above.
+        GGML_ASSERT(embd != nullptr && rows == nullptr);
+        embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
+        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        return;
+    }
+
+    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1874,9 +1917,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+
     ggml_tensor * emb = nullptr;
 
-    if (static_cast<const llama_model_qwen4exp &>(model).ple_reader) {
+    if (qmodel.ple_reader) {
         ple_inp->data = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
                                            hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->data);
@@ -1884,6 +1929,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         res->add_input(std::move(ple_inp));
 
         emb = ggml_reshape_2d(ctx0, data, hparams.ple_head_dim * n_heads, n_tokens);
+    } else if (qmodel.ple_disk) {
+        // table on disk: the gather happened in set_input and arrives as an F32 input,
+        // token-major, which reshapes to what the per-head gathers + concat produce
+        ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->embd);
+        ggml_tensor * embd = ple_inp->embd;
+        res->add_input(std::move(ple_inp));
+
+        emb = ggml_reshape_2d(ctx0, embd, hparams.ple_head_dim * n_heads, n_tokens);
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
         ggml_set_input(ple_inp->rows);
