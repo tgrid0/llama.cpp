@@ -1335,9 +1335,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        // the qsa3 kernel only handles an f16 KV cache; a quantized cache-type-k/v falls back
+        // to the generic masked path below instead of hitting the GGML_ASSERT further down
         const bool direct_indices =
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
-            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
         ggml_tensor * kq_mask_top_k = kq_mask;
         if (!direct_indices) {
         // prepare new kq mask - starts filled with -INFINITY
@@ -1371,8 +1378,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * q = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], n_query,
                 q_cur->nb[1], q_cur->nb[2], first*q_cur->nb[2]);
         if (n_stream != 1) { q = q_cur; }
-        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
         // TODO: enable sparse attention when we are ready
         // ref: https://github.com/ggml-org/llama.cpp/pull/27970
