@@ -357,35 +357,23 @@ struct server_slot {
             return false;
         }
 
-        if (cur->data.is_disk()) {
-            GGML_ASSERT(cur->data.mapping != nullptr);
-
-            const size_t n_tgt = llama_state_seq_get_data_ext(
-                ctx_tgt, cur->data.mapping, cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (n_tgt != cur_size_tgt) {
-                SLT_WRN(*this, "failed to save target prompt state: expected %zu bytes, wrote %zu\n", cur_size_tgt, n_tgt);
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt != cur_size_tgt) {
+            SLT_WRN(*this, "failed to save target prompt state: expected %zu bytes, wrote %zu\n", cur_size_tgt, n_tgt);
+            prompt_cache.discard(cur);
+            return false;
+        }
+        if (ctx_dft) {
+            const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft != cur_size_dft) {
+                SLT_WRN(*this, "failed to save draft prompt state: expected %zu bytes, wrote %zu\n", cur_size_dft, n_dft);
                 prompt_cache.discard(cur);
                 return false;
             }
-            if (ctx_dft) {
-                const size_t n_dft = llama_state_seq_get_data_ext(
-                    ctx_dft, cur->data.mapping + cur_size_tgt, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                if (n_dft != cur_size_dft) {
-                    SLT_WRN(*this, "failed to save draft prompt state: expected %zu bytes, wrote %zu\n", cur_size_dft, n_dft);
-                    prompt_cache.discard(cur);
-                    return false;
-                }
-            }
-
-            return prompt_cache.commit(cur);
-        } else {
-            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            }
         }
 
-        return true;
+        // no-op for RAM entries; disk entries flush the staged buffers to file here
+        return prompt_cache.commit(cur);
     }
 
     bool prompt_load(
@@ -1106,7 +1094,28 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // save active slot prompt states to the disk cache before the context is released
+    // (normal shutdown and sleeping-state teardown both go through destroy())
+    void flush_prompt_cache() {
+        if (!prompt_cache || prompt_cache->cache_dir.empty() || !ctx_tgt) {
+            return;
+        }
+
+        int n_saved = 0;
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0 && slot.prompt_save(*prompt_cache)) {
+                n_saved++;
+            }
+        }
+
+        if (n_saved > 0) {
+            SRV_INF("flushed %d active slot prompt state(s) to the disk cache\n", n_saved);
+        }
+    }
+
     void destroy() {
+        flush_prompt_cache();
+
         spec.reset();
 
         smpl_spf.reset();

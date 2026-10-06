@@ -619,8 +619,10 @@ struct server_prompt_data {
     std::vector<uint8_t> drft;
 
     std::string cache_file;
-    uint8_t * mapping = nullptr;
-    size_t mapping_size = 0;
+
+    // size of the payload on disk, valid only when is_disk() (0 until committed)
+    size_t file_size = 0;
+
     size_t main_size = 0;
     size_t drft_size = 0;
 
@@ -628,11 +630,6 @@ struct server_prompt_data {
     // metadata sidecar is committed, they survive object destruction and are
     // removed only by explicit cache eviction.
     bool remove_file_on_destroy = true;
-
-#ifdef _WIN32
-    void * file_handle = nullptr;
-    void * mapping_handle = nullptr;
-#endif
 
     server_prompt_data() = default;
     ~server_prompt_data();
@@ -652,7 +649,7 @@ struct server_prompt_data {
 
     size_t size() const {
         if (is_disk()) {
-            return mapping_size;
+            return file_size;
         }
         return main.size() + drft.size();
     }

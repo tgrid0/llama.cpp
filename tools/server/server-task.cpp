@@ -10,7 +10,6 @@
 #include "speculative.h"
 #include "server-common.h"
 
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,19 +19,6 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 //
 // task_params
@@ -1741,21 +1727,12 @@ server_prompt_data & server_prompt_data::operator=(server_prompt_data && other) 
     main         = std::move(other.main);
     drft         = std::move(other.drft);
     cache_file   = std::move(other.cache_file);
-    mapping      = other.mapping;
-    mapping_size = other.mapping_size;
+    file_size    = other.file_size;
     main_size    = other.main_size;
     drft_size    = other.drft_size;
     remove_file_on_destroy = other.remove_file_on_destroy;
 
-#ifdef _WIN32
-    file_handle    = other.file_handle;
-    mapping_handle = other.mapping_handle;
-    other.file_handle    = nullptr;
-    other.mapping_handle = nullptr;
-#endif
-
-    other.mapping      = nullptr;
-    other.mapping_size = 0;
+    other.file_size    = 0;
     other.main_size    = 0;
     other.drft_size    = 0;
     other.remove_file_on_destroy = true;
@@ -1765,26 +1742,6 @@ server_prompt_data & server_prompt_data::operator=(server_prompt_data && other) 
 }
 
 void server_prompt_data::clear() {
-    if (mapping != nullptr) {
-#ifdef _WIN32
-        UnmapViewOfFile(mapping);
-#else
-        munmap(mapping, mapping_size);
-#endif
-        mapping = nullptr;
-    }
-
-#ifdef _WIN32
-    if (mapping_handle != nullptr) {
-        CloseHandle((HANDLE) mapping_handle);
-        mapping_handle = nullptr;
-    }
-    if (file_handle != nullptr) {
-        CloseHandle((HANDLE) file_handle);
-        file_handle = nullptr;
-    }
-#endif
-
     if (!cache_file.empty()) {
         if (remove_file_on_destroy) {
             std::error_code ec;
@@ -1803,7 +1760,7 @@ void server_prompt_data::clear() {
         cache_file.clear();
     }
 
-    mapping_size = 0;
+    file_size = 0;
     main_size = 0;
     drft_size = 0;
     remove_file_on_destroy = true;
@@ -1816,16 +1773,12 @@ void server_prompt_data::discard() {
     clear();
 }
 
-static bool server_prompt_cache_alloc_disk(
-        server_prompt_data & data,
+// pick a unique cache file name and create an empty placeholder; the payload is
+// written at commit time. no mapping is kept - entries are read back on demand
+static bool server_prompt_cache_reserve_file(
         const std::string & cache_dir,
         uint64_t & next_file_id,
-        size_t size) {
-    if (size == 0) {
-        SRV_ERR("%s", "cannot allocate an empty disk cache state\n");
-        return false;
-    }
-
+        std::string & path_out) {
     if (next_file_id == 0) {
         next_file_id = (uint64_t) ggml_time_us();
     }
@@ -1833,92 +1786,24 @@ static bool server_prompt_cache_alloc_disk(
     for (;;) {
         const std::filesystem::path path = std::filesystem::path(cache_dir) /
             ("llama-prompt-cache-" + std::to_string(next_file_id++) + ".bin");
-        const std::string path_str = path.string();
 
-#ifdef _WIN32
-        HANDLE file = CreateFileA(
-            path_str.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-            CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-        if (file == INVALID_HANDLE_VALUE) {
-            if (GetLastError() == ERROR_FILE_EXISTS) {
-                continue;
-            }
-            SRV_ERR("failed to create disk cache file %s (error %lu)\n", path_str.c_str(), GetLastError());
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            continue;
+        }
+
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            SRV_ERR("failed to create disk cache file %s\n", path.string().c_str());
+            return false;
+        }
+        output.close();
+        if (output.fail()) {
+            SRV_ERR("failed to create disk cache file %s\n", path.string().c_str());
             return false;
         }
 
-        LARGE_INTEGER file_size;
-        file_size.QuadPart = size;
-        if (!SetFilePointerEx(file, file_size, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) {
-            SRV_ERR("failed to resize disk cache file %s (error %lu)\n", path_str.c_str(), GetLastError());
-            CloseHandle(file);
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            return false;
-        }
-
-        HANDLE mapping_handle = CreateFileMappingA(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
-        if (mapping_handle == nullptr) {
-            SRV_ERR("failed to map disk cache file %s (error %lu)\n", path_str.c_str(), GetLastError());
-            CloseHandle(file);
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            return false;
-        }
-
-        void * mapping = MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, size);
-        if (mapping == nullptr) {
-            SRV_ERR("failed to open disk cache mapping %s (error %lu)\n", path_str.c_str(), GetLastError());
-            CloseHandle(mapping_handle);
-            CloseHandle(file);
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            return false;
-        }
-
-        data.cache_file    = path_str;
-        data.mapping       = (uint8_t *) mapping;
-        data.mapping_size  = size;
-        data.file_handle   = file;
-        data.mapping_handle = mapping_handle;
-#else
-        if (size > (size_t) std::numeric_limits<off_t>::max()) {
-            SRV_ERR("disk cache state is too large: %zu bytes\n", size);
-            return false;
-        }
-
-        const int fd = open(path_str.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-        if (fd < 0) {
-            if (errno == EEXIST) {
-                continue;
-            }
-            SRV_ERR("failed to create disk cache file %s: %s\n", path_str.c_str(), strerror(errno));
-            return false;
-        }
-
-        if (ftruncate(fd, (off_t) size) != 0) {
-            SRV_ERR("failed to resize disk cache file %s: %s\n", path_str.c_str(), strerror(errno));
-            close(fd);
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            return false;
-        }
-
-        void * mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        const int mmap_errno = errno;
-        close(fd);
-        if (mapping == MAP_FAILED) {
-            SRV_ERR("failed to map disk cache file %s: %s\n", path_str.c_str(), strerror(mmap_errno));
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            return false;
-        }
-
-        data.cache_file   = path_str;
-        data.mapping      = (uint8_t *) mapping;
-        data.mapping_size = size;
-#endif
-
+        path_out = path.string();
         return true;
     }
 }
@@ -1987,91 +1872,112 @@ void server_prompt_cache_remove_files(const std::filesystem::path & data_path) {
     }
 }
 
-bool server_prompt_cache_flush_disk(server_prompt_data & data) {
-#ifdef _WIN32
-    if (!FlushViewOfFile(data.mapping, data.mapping_size)) {
-        SRV_ERR("failed to flush disk cache mapping %s (error %lu)\n", data.cache_file.c_str(), GetLastError());
+// write the staged state (target, draft, checkpoints) straight to the payload file
+// and record the checkpoint offsets for the metadata sidecar. the staging vectors
+// are released afterwards - committed entries live on disk until restored
+bool server_prompt_cache_write_payload(server_prompt_cache_state & state) {
+    std::ofstream output(state.data.cache_file, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        SRV_ERR("failed to open disk cache file %s\n", state.data.cache_file.c_str());
         return false;
     }
-    if (!FlushFileBuffers((HANDLE) data.file_handle)) {
-        SRV_ERR("failed to flush disk cache file %s (error %lu)\n", data.cache_file.c_str(), GetLastError());
+
+    bool ok = true;
+
+    if (!state.data.main.empty()) {
+        output.write(reinterpret_cast<const char *>(state.data.main.data()), state.data.main.size());
+        ok = output.good();
+    }
+    if (ok && !state.data.drft.empty()) {
+        output.write(reinterpret_cast<const char *>(state.data.drft.data()), state.data.drft.size());
+        ok = output.good();
+    }
+
+    state.checkpoints_disk.clear();
+
+    size_t offset = state.data.main.size() + state.data.drft.size();
+    for (const auto & checkpoint : state.prompt.checkpoints) {
+        server_prompt_cache_checkpoint checkpoint_disk;
+        checkpoint_disk.n_tokens = checkpoint.n_tokens;
+        checkpoint_disk.id_task  = checkpoint.id_task;
+        checkpoint_disk.pos_min  = checkpoint.pos_min;
+        checkpoint_disk.pos_max  = checkpoint.pos_max;
+
+        checkpoint_disk.offset_tgt = offset;
+        checkpoint_disk.size_tgt   = checkpoint.data_tgt.size();
+        if (checkpoint_disk.size_tgt > 0) {
+            output.write(reinterpret_cast<const char *>(checkpoint.data_tgt.data()), checkpoint_disk.size_tgt);
+            offset += checkpoint_disk.size_tgt;
+        }
+
+        checkpoint_disk.offset_dft = offset;
+        checkpoint_disk.size_dft   = checkpoint.data_dft.size();
+        if (checkpoint_disk.size_dft > 0) {
+            output.write(reinterpret_cast<const char *>(checkpoint.data_dft.data()), checkpoint_disk.size_dft);
+            offset += checkpoint_disk.size_dft;
+        }
+
+        checkpoint_disk.offset_spec = offset;
+        checkpoint_disk.size_spec   = checkpoint.data_spec.size();
+        if (checkpoint_disk.size_spec > 0) {
+            output.write(reinterpret_cast<const char *>(checkpoint.data_spec.data()), checkpoint_disk.size_spec);
+            offset += checkpoint_disk.size_spec;
+        }
+
+        state.checkpoints_disk.push_back(checkpoint_disk);
+    }
+
+    output.close();
+    ok = ok && !output.fail() && !output.bad();
+
+    if (!ok) {
+        SRV_ERR("failed to write disk cache payload %s\n", state.data.cache_file.c_str());
+        state.checkpoints_disk.clear();
         return false;
     }
-#else
-    if (msync(data.mapping, data.mapping_size, MS_SYNC) != 0) {
-        SRV_ERR("failed to flush disk cache file %s: %s\n", data.cache_file.c_str(), strerror(errno));
-        return false;
-    }
-#endif
+
+    state.data.main_size = state.data.main.size();
+    state.data.drft_size = state.data.drft.size();
+    state.data.file_size = offset;
+
+    state.data.main.clear();
+    state.data.main.shrink_to_fit();
+    state.data.drft.clear();
+    state.data.drft.shrink_to_fit();
+    state.prompt.checkpoints.clear();
+
     return true;
 }
 
-bool server_prompt_cache_open_disk(
-        server_prompt_data & data,
-        const std::filesystem::path & path,
-        size_t size) {
-    const std::string path_str = path.string();
-
-#ifdef _WIN32
-    HANDLE file = CreateFileA(
-        path_str.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        SRV_WRN("failed to open disk cache file %s (error %lu)\n", path_str.c_str(), GetLastError());
+// read a committed payload file into a transient buffer for restoring into a context
+bool server_prompt_cache_read_payload(const server_prompt_data & data, std::vector<uint8_t> & out) {
+    std::ifstream input(data.cache_file, std::ios::binary | std::ios::ate);
+    if (!input) {
+        SRV_WRN("failed to open disk cache file %s\n", data.cache_file.c_str());
         return false;
     }
 
-    LARGE_INTEGER file_size;
-    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0 || (uint64_t) file_size.QuadPart != size) {
-        SRV_WRN("disk cache file has an unexpected size: %s\n", path_str.c_str());
-        CloseHandle(file);
+    const std::streamoff size = input.tellg();
+    if (size < 0 || (uint64_t) size != data.file_size) {
+        SRV_WRN("disk cache file has an unexpected size: %s\n", data.cache_file.c_str());
         return false;
     }
 
-    HANDLE mapping_handle = CreateFileMappingA(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
-    if (mapping_handle == nullptr) {
-        SRV_WRN("failed to map disk cache file %s (error %lu)\n", path_str.c_str(), GetLastError());
-        CloseHandle(file);
+    input.seekg(0);
+    try {
+        out.resize((size_t) size);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory to restore disk cache file %s: %s\n", data.cache_file.c_str(), e.what());
         return false;
     }
 
-    void * mapping = MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, size);
-    if (mapping == nullptr) {
-        SRV_WRN("failed to open disk cache mapping %s (error %lu)\n", path_str.c_str(), GetLastError());
-        CloseHandle(mapping_handle);
-        CloseHandle(file);
+    if (!out.empty()) {
+        input.read(reinterpret_cast<char *>(out.data()), out.size());
+    }
+    if (input.fail()) {
+        SRV_WRN("failed to read disk cache file %s\n", data.cache_file.c_str());
         return false;
     }
-
-    data.file_handle    = file;
-    data.mapping_handle = mapping_handle;
-#else
-    const int fd = open(path_str.c_str(), O_RDWR);
-    if (fd < 0) {
-        SRV_WRN("failed to open disk cache file %s: %s\n", path_str.c_str(), strerror(errno));
-        return false;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < 0 || (uint64_t) st.st_size != size) {
-        SRV_WRN("disk cache file has an unexpected size: %s\n", path_str.c_str());
-        close(fd);
-        return false;
-    }
-
-    void * mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    const int mmap_errno = errno;
-    close(fd);
-    if (mapping == MAP_FAILED) {
-        SRV_WRN("failed to map disk cache file %s: %s\n", path_str.c_str(), strerror(mmap_errno));
-        return false;
-    }
-#endif
-
-    data.cache_file = path_str;
-    data.mapping = (uint8_t *) mapping;
-    data.mapping_size = size;
-    data.remove_file_on_destroy = false;
 
     return true;
 }
@@ -2094,7 +2000,7 @@ bool server_prompt_cache_write_metadata(
     const uint32_t flags = state.prompt.tokens.has_mtmd ? SERVER_PROMPT_CACHE_META_FLAG_MTMD : 0;
     const uint64_t key_size = cache_key.size();
     const uint64_t tokens_size = serialized_tokens.size();
-    const uint64_t payload_size = state.data.mapping_size;
+    const uint64_t payload_size = state.data.file_size;
     const uint64_t main_size = state.data.main_size;
     const uint64_t drft_size = state.data.drft_size;
     const uint64_t checkpoint_count = state.checkpoints_disk.size();
@@ -2328,9 +2234,14 @@ bool server_prompt_cache_read_metadata(
 
     std::filesystem::path data_path = metadata_path;
     data_path.replace_extension();
-    if (!server_prompt_cache_open_disk(state.data, data_path, payload_size)) {
+
+    if (!std::filesystem::exists(data_path, ec) || ec) {
         return false;
     }
+
+    state.data.cache_file = data_path.string();
+    state.data.file_size  = (size_t) payload_size;
+    state.data.remove_file_on_destroy = false;
 
     return true;
 }
@@ -2514,62 +2425,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     server_prompt_cache_state state;
     state.prompt.tokens = prompt.tokens.clone();
 
+    // the disk payload is staged in RAM and flushed to file at commit()
+    state.prompt.checkpoints = prompt.checkpoints;
+
+    try {
+        state.data.main.resize(state_size_tgt);
+        state.data.drft.resize(state_size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+
+        limit_size = std::max<size_t>(1, 0.4*size());
+
+        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+
+        update();
+
+        return nullptr;
+    }
+
     if (!cache_dir.empty()) {
-        if (!server_prompt_cache_alloc_disk(state.data, cache_dir, next_file_id, state_size_new)) {
+        if (state_size_new == 0) {
+            SRV_ERR("%s", "cannot allocate an empty disk cache state\n");
             return nullptr;
         }
 
-        state.data.main_size = state_size_tgt;
-        state.data.drft_size = state_size_dft;
-
-        size_t offset = state_size_tgt + state_size_dft;
-        state.checkpoints_disk.reserve(prompt.checkpoints.size());
-        for (const auto & checkpoint : prompt.checkpoints) {
-            server_prompt_cache_checkpoint checkpoint_disk;
-            checkpoint_disk.n_tokens = checkpoint.n_tokens;
-            checkpoint_disk.id_task  = checkpoint.id_task;
-            checkpoint_disk.pos_min  = checkpoint.pos_min;
-            checkpoint_disk.pos_max  = checkpoint.pos_max;
-
-            checkpoint_disk.offset_tgt = offset;
-            checkpoint_disk.size_tgt   = checkpoint.data_tgt.size();
-            if (checkpoint_disk.size_tgt > 0) {
-                memcpy(state.data.mapping + offset, checkpoint.data_tgt.data(), checkpoint_disk.size_tgt);
-                offset += checkpoint_disk.size_tgt;
-            }
-
-            checkpoint_disk.offset_dft = offset;
-            checkpoint_disk.size_dft   = checkpoint.data_dft.size();
-            if (checkpoint_disk.size_dft > 0) {
-                memcpy(state.data.mapping + offset, checkpoint.data_dft.data(), checkpoint_disk.size_dft);
-                offset += checkpoint_disk.size_dft;
-            }
-
-            checkpoint_disk.offset_spec = offset;
-            checkpoint_disk.size_spec   = checkpoint.data_spec.size();
-            if (checkpoint_disk.size_spec > 0) {
-                memcpy(state.data.mapping + offset, checkpoint.data_spec.data(), checkpoint_disk.size_spec);
-                offset += checkpoint_disk.size_spec;
-            }
-
-            state.checkpoints_disk.push_back(checkpoint_disk);
-        }
-        GGML_ASSERT(offset == state_size_new);
-    } else {
-        state.prompt.checkpoints = prompt.checkpoints;
-
-        try {
-            state.data.main.resize(state_size_tgt);
-            state.data.drft.resize(state_size_dft);
-        } catch (const std::bad_alloc & e) {
-            SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-            limit_size = std::max<size_t>(1, 0.4*size());
-
-            SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-            update();
-
+        if (!server_prompt_cache_reserve_file(cache_dir, next_file_id, state.data.cache_file)) {
             return nullptr;
         }
     }
@@ -2591,7 +2471,7 @@ bool server_prompt_cache::commit(server_prompt_cache_state * state) {
         return false;
     }
 
-    bool ok = server_prompt_cache_flush_disk(it->data);
+    bool ok = server_prompt_cache_write_payload(*it);
     try {
         ok = ok && server_prompt_cache_write_metadata(*it, cache_key);
     } catch (const std::exception & e) {
@@ -2704,7 +2584,7 @@ bool server_prompt_cache::load(
 
     auto it_best = states.end();
     int effective_prefix_reuse_best = -1;
-    size_t mapping_size_best = 0;
+    size_t file_size_best = 0;
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -2754,10 +2634,10 @@ bool server_prompt_cache::load(
             const bool is_better = is_admissible &&
                 (it_best == states.end() ||
                  effective_prefix_reuse > effective_prefix_reuse_best ||
-                 (effective_prefix_reuse == effective_prefix_reuse_best && it->data.mapping_size <= mapping_size_best));
+                 (effective_prefix_reuse == effective_prefix_reuse_best && it->data.file_size <= file_size_best));
             if (is_better) {
                 effective_prefix_reuse_best = effective_prefix_reuse;
-                mapping_size_best = it->data.mapping_size;
+                file_size_best = it->data.file_size;
                 f_keep_best = f_keep_cur;
                 f_sim_best  = f_sim_cur;
                 it_best = it;
@@ -2792,7 +2672,16 @@ bool server_prompt_cache::load(
         if (it_best->data.is_disk()) {
             auto & data = it_best->data;
 
-            const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, data.mapping, data.main_size, id_slot, 0);
+            // read the payload back into a transient buffer - nothing stays mapped
+            std::vector<uint8_t> payload_buf;
+            if (!server_prompt_cache_read_payload(data, payload_buf)) {
+                SRV_WRN("%s", " - failed to read disk prompt cache entry, dropping it\n");
+                data.discard();
+                states.erase(it_best);
+                return false;
+            }
+
+            const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, payload_buf.data(), data.main_size, id_slot, 0);
             if (n_tgt != data.main_size) {
                 SRV_ERR("failed to restore state with size %zu\n", data.main_size);
                 data.discard();
@@ -2808,7 +2697,7 @@ bool server_prompt_cache::load(
                     return false;
                 }
 
-                const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, data.mapping + data.main_size, data.drft_size, id_slot, 0);
+                const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, payload_buf.data() + data.main_size, data.drft_size, id_slot, 0);
                 if (n_dft != data.drft_size) {
                     SRV_WRN("failed to restore state with size %zu\n", data.drft_size);
                     data.discard();
@@ -2828,14 +2717,14 @@ bool server_prompt_cache::load(
                     checkpoint.pos_max  = checkpoint_disk.pos_max;
 
                     checkpoint.data_tgt.assign(
-                        data.mapping + checkpoint_disk.offset_tgt,
-                        data.mapping + checkpoint_disk.offset_tgt + checkpoint_disk.size_tgt);
+                        payload_buf.data() + checkpoint_disk.offset_tgt,
+                        payload_buf.data() + checkpoint_disk.offset_tgt + checkpoint_disk.size_tgt);
                     checkpoint.data_dft.assign(
-                        data.mapping + checkpoint_disk.offset_dft,
-                        data.mapping + checkpoint_disk.offset_dft + checkpoint_disk.size_dft);
+                        payload_buf.data() + checkpoint_disk.offset_dft,
+                        payload_buf.data() + checkpoint_disk.offset_dft + checkpoint_disk.size_dft);
                     checkpoint.data_spec.assign(
-                        data.mapping + checkpoint_disk.offset_spec,
-                        data.mapping + checkpoint_disk.offset_spec + checkpoint_disk.size_spec);
+                        payload_buf.data() + checkpoint_disk.offset_spec,
+                        payload_buf.data() + checkpoint_disk.offset_spec + checkpoint_disk.size_spec);
 
                     restored.checkpoints.push_back(std::move(checkpoint));
                 }
