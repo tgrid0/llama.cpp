@@ -1758,6 +1758,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "deprecated alias for --cache-dir",
+        [](common_params & params, const std::string & value) {
+            LOG_WRN("DEPRECATED: --cache-disk is an alias for --cache-dir\n");
+            params.cache_dir_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "N",
+        "deprecated alias for --cache-dir-max",
+        [](common_params & params, int value) {
+            LOG_WRN("DEPRECATED: --cache-disk-size is an alias for --cache-dir-max\n");
+            if (value < -1) {
+                throw std::invalid_argument("cache-disk-size must be -1 or non-negative");
+            }
+            params.cache_dir_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
