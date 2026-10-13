@@ -434,3 +434,13 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Model-free coverage for aligned payload I/O and legacy unpadded files.
+llama_build(test-prompt-cache-io.cpp)
+llama_test(test-prompt-cache-io ARGS ${CMAKE_CURRENT_BINARY_DIR}/prompt-cache-io.bin)
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    target_link_libraries(test-prompt-cache-io PRIVATE server-context)
+    target_compile_definitions(test-prompt-cache-io PRIVATE LLAMA_SERVER_CACHE_TESTS)
+    llama_test(test-prompt-cache-io NAME test-prompt-cache-state ARGS ${CMAKE_CURRENT_BINARY_DIR}/prompt-cache-state --model ${CMAKE_BINARY_DIR}/tinyllamas/stories15M-q4_0.gguf)
+    set_tests_properties(test-prompt-cache-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()

@@ -365,6 +365,21 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
         }
         LOG_TRC("%s: seq 0 copied, %zd bytes\n", __func__, ncopy);
 
+        std::vector<uint8_t> streamed;
+        const auto write = [](void * user, const void * src, size_t size) {
+            if (size > 1024 * 1024) return false;
+            auto & bytes = *static_cast<std::vector<uint8_t> *>(user);
+            const auto * first = static_cast<const uint8_t *>(src);
+            bytes.insert(bytes.end(), first, first + size);
+            return true;
+        };
+        if (llama_state_seq_write_stream(ctx.get(), 0, write, &streamed) != ncopy || streamed != seq_store) {
+            LOG_ERR("%s: streamed state differs from buffer serialization\n", __func__);
+            return false;
+        }
+        const auto fail_write = [](void *, const void *, size_t) { return false; };
+        if (llama_state_seq_write_stream(ctx.get(), 0, fail_write, nullptr) != 0) return false;
+
         llama_memory_clear(llama_get_memory(ctx.get()), true);
         LOG_TRC("%s: kv cache cleared\n", __func__);
 
@@ -374,6 +389,26 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
             return false;
         }
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
+
+        struct reader {
+            const std::vector<uint8_t> & bytes;
+            size_t offset = 0;
+        } input{seq_store};
+        const auto read = [](void * user, void * dst, size_t size) {
+            auto & input = *static_cast<reader *>(user);
+            if (size > 1024 * 1024 || size > input.bytes.size() - input.offset) return false;
+            std::memcpy(dst, input.bytes.data() + input.offset, size);
+            input.offset += size;
+            return true;
+        };
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        if (llama_state_seq_read_stream(ctx.get(), 1, seq_store.size() - 1, read, &input) != 0) return false;
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        input.offset = 0;
+        if (llama_state_seq_read_stream(ctx.get(), 1, seq_store.size(), read, &input) != seq_store.size()) {
+            LOG_ERR("%s: streamed state restore failed\n", __func__);
+            return false;
+        }
     }
 
     // Generate tokens and compare logits against the baseline

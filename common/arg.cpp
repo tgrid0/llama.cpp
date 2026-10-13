@@ -1751,11 +1751,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
-        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
+        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires --cache-ram or active --cache-disk)",
         [](common_params & params, bool value) {
             params.cache_idle_slots = value;
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "path to disk cache directory (requires nonzero --cache-disk-size, bypasses --cache-ram when active)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "N",
+        string_format("maximum disk cache size in MiB (default: %d, -1 = no limit, 0 = disabled)", params.cache_disk_size_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_size_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},

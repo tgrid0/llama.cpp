@@ -972,6 +972,20 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Stream host sequence state without allocating a complete state buffer.
+    // Callbacks return false on I/O failure. Transfers are at most 1 MiB.
+    // A failed restore may mutate the destination; remove its sequence before reuse.
+    typedef bool (*llama_state_read_callback)(void * user_data, void * dst, size_t size);
+    typedef bool (*llama_state_write_callback)(void * user_data, const void * src, size_t size);
+
+    LLAMA_API size_t llama_state_seq_read_stream(
+            struct llama_context * ctx, llama_seq_id dest_seq_id, size_t size,
+            llama_state_read_callback callback, void * user_data);
+
+    LLAMA_API size_t llama_state_seq_write_stream(
+            struct llama_context * ctx, llama_seq_id seq_id,
+            llama_state_write_callback callback, void * user_data);
+
     //
     // Decoding
     //

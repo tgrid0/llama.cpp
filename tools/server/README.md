@@ -167,7 +167,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
-| `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--cache-disk PATH` | path to disk cache directory (requires nonzero --cache-disk-size, bypasses --cache-ram when active)<br/>(env: LLAMA_ARG_CACHE_DISK) |
+| `--cache-disk-size N` | maximum disk cache size in MiB (default: 0, -1 = no limit, 0 = disabled)<br/>(env: LLAMA_ARG_CACHE_DISK_SIZE) |
+| `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires --cache-ram or active --cache-disk)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -2239,3 +2241,17 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+### Persistent prompt cache
+
+Use `--cache-disk PATH --cache-disk-size N` to keep prompt state across server restarts. `N` is the payload limit in MiB, including draft state, checkpoints and media metadata. The default `0` disables the cache; `-1` removes the limit. For example:
+
+```sh
+llama-server -m model.gguf --cache-disk ./prompt-cache --cache-disk-size 8192
+```
+
+The active disk cache replaces the RAM prompt cache. It saves idle or displaced slots and flushes slots on graceful shutdown. Exact and prefix matches can restore state, including caches saved with a different `--parallel` count. Least recently used entries are evicted when necessary; lowering the limit also evicts entries at startup.
+
+Linux payload reads and writes use bounded, aligned direct I/O buffers. The cache filesystem must support `O_DIRECT`; unsupported I/O produces a cache miss or a failed save. Other platforms use bounded standard file I/O. The implementation does not map writable model state into cache files.
+
+Use a dedicated directory for each server instance. Concurrent sharing is unsupported. Old index formats and changes to model paths, file sizes, modification times or relevant context settings invalidate the cache. Keep model files immutable while using a cache. LoRA, control vectors and metadata overrides currently disable disk caching. This format does not import the reverted halobox cache.

@@ -3221,6 +3221,120 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+class llama_io_read_callback : public llama_io_read_i {
+public:
+    llama_io_read_callback(llama_state_read_callback callback, void * user, size_t size)
+        : callback(callback), user(user), remaining(size) {}
+    void read(void * dst, size_t size) override {
+        if (size > remaining) throw std::runtime_error("sequence stream exceeds payload");
+        auto * bytes = static_cast<uint8_t *>(dst);
+        while (size) {
+            const size_t n = std::min(size, capacity);
+            if (!callback(user, bytes, n)) throw std::runtime_error("sequence stream read failed");
+            bytes += n;
+            size -= n;
+            remaining -= n;
+            count += n;
+        }
+    }
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > remaining) throw std::runtime_error("sequence tensor exceeds payload");
+        buffer.resize(std::min(size, capacity));
+        while (size) {
+            const size_t n = std::min(size, capacity);
+            read(buffer.data(), n);
+            ggml_backend_tensor_set(tensor, buffer.data(), offset, n);
+            offset += n;
+            size -= n;
+        }
+    }
+    size_t n_bytes() override { return count; }
+private:
+    static constexpr size_t capacity = 1024 * 1024;
+    llama_state_read_callback callback;
+    void * user;
+    size_t remaining;
+    size_t count = 0;
+    std::vector<uint8_t> buffer;
+};
+
+class llama_io_write_callback : public llama_io_write_i {
+public:
+    llama_io_write_callback(llama_state_write_callback callback, void * user) : callback(callback), user(user) {}
+    void write(const void * src, size_t size) override {
+        const auto * bytes = static_cast<const uint8_t *>(src);
+        while (size) {
+            const size_t n = std::min(size, capacity);
+            if (!callback(user, bytes, n)) throw std::runtime_error("sequence stream write failed");
+            bytes += n;
+            size -= n;
+            count += n;
+        }
+    }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        buffer.resize(std::min(size, capacity));
+        while (size) {
+            const size_t n = std::min(size, capacity);
+            ggml_backend_tensor_get(tensor, buffer.data(), offset, n);
+            write(buffer.data(), n);
+            offset += n;
+            size -= n;
+        }
+    }
+    size_t n_bytes() override { return count; }
+private:
+    static constexpr size_t capacity = 1024 * 1024;
+    llama_state_write_callback callback;
+    void * user;
+    size_t count = 0;
+    std::vector<uint8_t> buffer;
+};
+
+size_t llama_context::state_seq_read_stream(llama_seq_id seq_id, size_t size,
+        llama_state_read_callback callback, void * user) {
+    if (!callback) return 0;
+    try {
+        synchronize();
+        llama_io_read_callback io(callback, user, size);
+        uint32_t magic;
+        llama_seq_id source_seq;
+        io.read(&magic, sizeof(magic));
+        if (magic != io_magic) throw std::runtime_error("wrong sequence state magic");
+        io.read(&source_seq, sizeof(source_seq));
+        const size_t count = state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (count != size) throw std::runtime_error("sequence stream size mismatch");
+        return count;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_write_stream(llama_seq_id seq_id,
+        llama_state_write_callback callback, void * user) {
+    if (!callback) return 0;
+    try {
+        synchronize();
+        llama_io_write_callback io(callback, user);
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        return state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_read_stream(llama_context * ctx, llama_seq_id seq_id, size_t size,
+        llama_state_read_callback callback, void * user) {
+    return ctx ? ctx->state_seq_read_stream(seq_id, size, callback, user) : 0;
+}
+
+size_t llama_state_seq_write_stream(llama_context * ctx, llama_seq_id seq_id,
+        llama_state_write_callback callback, void * user) {
+    return ctx ? ctx->state_seq_write_stream(seq_id, callback, user) : 0;
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {

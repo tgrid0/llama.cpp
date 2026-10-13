@@ -457,6 +457,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             server_stream_session_manager_stop();
             ctx_http.stop();
             ctx_server.terminate();
+            ctx_server.flush_disk_cache();
             mcp_mgr.shutdown();
             llama_backend_free();
         };
